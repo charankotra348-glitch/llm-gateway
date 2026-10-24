@@ -1,0 +1,14 @@
+# Model names clients send -> provider models, in fallback order (fallback arrives Day 3).
+# A route may only use providers that are configured (see .env.example).
+routes:
+  demo:
+    - provider: fake
+      model: fake-echo
+  # fast:
+  #   - provider: gemini
+  #     model: gemini-2.5-flash
+  #   - provider: bedrock
+  #     model: us.amazon.nova-2-lite-v1:0
+  # local:
+  #   - provider: ollama
+  #     model: llama3.2
