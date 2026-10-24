@@ -15,6 +15,7 @@ from gateway.keys import create_key
 from gateway.main import Gateway, create_app
 from gateway.pricing import PriceTable
 from gateway.providers.fake import FakeProvider
+from gateway.resilience import Resilience, ResiliencePolicy
 from gateway.routes import RouteTable
 
 
@@ -74,7 +75,8 @@ def prices():
 def gateway(database_url, fake, prices):
     routes = RouteTable.from_dict({"routes": {"demo": [{"provider": "fake", "model": "fake-echo"}]}})
     engine = make_engine(database_url)
-    return Gateway({"fake": fake}, routes, make_sessions(engine), prices=prices, timeout_s=1.0, engine=engine)
+    resilience = Resilience(ResiliencePolicy(attempt_timeout_s=1.0, backoff_s=0))
+    return Gateway({"fake": fake}, routes, make_sessions(engine), prices=prices, resilience=resilience, engine=engine)
 
 
 def run_db(database_url, fn):

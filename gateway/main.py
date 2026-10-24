@@ -19,6 +19,7 @@ from gateway.ledger import month_usage
 from gateway.models import ApiKey, RequestLog
 from gateway.pricing import PriceTable
 from gateway.providers.base import Provider
+from gateway.resilience import Attempt, Resilience, ResiliencePolicy
 from gateway.routes import RouteTable
 from gateway.schemas import ChatCompletionRequest, Completion, normalize
 
@@ -35,12 +36,12 @@ class Gateway:
     """Everything a request needs: providers by name, routes, prices, the database."""
 
     def __init__(self, providers: dict[str, Provider], routes: RouteTable, sessions: async_sessionmaker,
-                 *, prices: PriceTable | None = None, timeout_s: float = 30.0, engine=None):
+                 *, prices: PriceTable | None = None, resilience: Resilience | None = None, engine=None):
         self.providers = providers
         self.routes = routes
         self.sessions = sessions
         self.prices = prices or PriceTable({})
-        self.timeout_s = timeout_s
+        self.resilience = resilience or Resilience()
         self._engine = engine
 
     def unpriced_targets(self) -> list[str]:
@@ -59,6 +60,7 @@ def build_gateway(settings: Settings) -> Gateway:
     if settings.enable_fake:
         from gateway.providers.fake import FakeProvider
         providers["fake"] = FakeProvider()
+        providers["flaky"] = FakeProvider(failure_rate=settings.flaky_failure_rate)
     if settings.gemini_api_key:
         from gateway.providers.gemini import GeminiProvider
         providers["gemini"] = GeminiProvider(settings.gemini_api_key)
@@ -70,8 +72,12 @@ def build_gateway(settings: Settings) -> Gateway:
         providers["ollama"] = OllamaProvider(settings.ollama_url)
     routes = RouteTable.load(settings.routes_file, known_providers=set(providers))
     engine = make_engine(settings.database_url)
+    policy = ResiliencePolicy(
+        attempt_timeout_s=settings.request_timeout_s, total_timeout_s=settings.total_timeout_s,
+        attempts_per_target=settings.attempts_per_target, backoff_s=settings.retry_backoff_s,
+        breaker_threshold=settings.breaker_threshold, breaker_cooldown_s=settings.breaker_cooldown_s)
     return Gateway(providers, routes, make_sessions(engine), prices=PriceTable.load(settings.prices_file),
-                   timeout_s=settings.request_timeout_s, engine=engine)
+                   resilience=Resilience(policy), engine=engine)
 
 
 async def authenticate(request: Request) -> ApiKey:
@@ -123,6 +129,12 @@ def create_app(gateway: Gateway | None = None) -> FastAPI:
                 "data": [{"id": n, "object": "model", "created": 0, "owned_by": "llm-gateway"}
                          for n in gw.routes.names()]}
 
+    @app.get("/v1/status")
+    async def status(request: Request, key: ApiKey = Depends(authenticate)):
+        """Circuit breaker state of every target that has been called. Not part of the OpenAI API."""
+        gw: Gateway = request.app.state.gateway
+        return {"targets": gw.resilience.states()}
+
     @app.get("/v1/usage")
     async def usage(request: Request, key: ApiKey = Depends(authenticate)):
         """This key's spend in the current calendar month (UTC). Not part of the OpenAI API."""
@@ -153,18 +165,16 @@ def create_app(gateway: Gateway | None = None) -> FastAPI:
                 raise BudgetExceeded(f"This key's monthly budget of ${key.monthly_budget_micros / 1e6:.2f} "
                                      f"is used up (estimated spend ${spent / 1e6:.4f}). It resets on the 1st (UTC).")
 
-        target = route.targets[0]       # fallback across targets arrives with Day 3
-        provider = gw.providers[target.provider]
-        outcome, completion = "error", None
         try:
-            completion = await provider.complete(chat, model=target.model, timeout_s=gw.timeout_s)
-            outcome = "ok"
+            result = await gw.resilience.complete(route, chat, gw.providers)
         except GatewayError as exc:
-            outcome = exc.code
-            raise
-        finally:
-            await _record(gw, request_id, key, route.name, target.provider, target.model, outcome, completion,
+            attempts = getattr(exc, "attempts", [])
+            await _record(gw, request_id, key, route.name, attempts, exc.code, None,
                           latency_ms=(time.perf_counter() - started) * 1000)
+            raise
+        completion, target = result.completion, result.target
+        await _record(gw, request_id, key, route.name, result.attempts, "ok", completion,
+                      latency_ms=(time.perf_counter() - started) * 1000)
 
         usage = None
         if completion.input_tokens is not None and completion.output_tokens is not None:
@@ -182,28 +192,36 @@ def create_app(gateway: Gateway | None = None) -> FastAPI:
                 "usage": usage,
             },
             headers={"x-gateway-route": route.name, "x-gateway-provider": target.provider,
-                     "x-request-id": request_id},
+                     "x-gateway-attempts": str(result.calls), "x-request-id": request_id},
         )
 
     return app
 
 
-async def _record(gw: Gateway, request_id: str, key: ApiKey, route: str, provider: str, model: str,
-                  outcome: str, completion: Completion | None, *, latency_ms: float) -> None:
+async def _record(gw: Gateway, request_id: str, key: ApiKey, route: str, attempts: list[Attempt], outcome: str,
+                  completion: Completion | None, *, latency_ms: float) -> None:
     """Log line + ledger row. A ledger failure is logged, never turned into a failed response:
-    the provider has already been paid for the answer."""
+    the provider has already been paid for the answer.
+
+    Requests that never reached a provider (every circuit open) are not recorded."""
+    calls = [a for a in attempts if a.outcome != "circuit_open"]
+    if not calls:
+        log.info(json.dumps({"event": "chat_completion", "id": request_id, "key": key.prefix, "route": route,
+                             "outcome": outcome, "attempts": [a.__dict__ for a in attempts]}))
+        return
+    provider, model = calls[-1].provider, calls[-1].model     # who answered, or the last one tried
     tokens_in = completion.input_tokens if completion else None
     tokens_out = completion.output_tokens if completion else None
     cost = gw.prices.cost_micros(provider, model, tokens_in, tokens_out) if completion else 0
     line = {"event": "chat_completion", "id": request_id, "key": key.prefix, "route": route,
             "provider": provider, "model": model, "outcome": outcome, "latency_ms": round(latency_ms, 1),
             "input_tokens": tokens_in, "output_tokens": tokens_out,
-            "cost_usd": None if cost is None else cost / 1e6}
+            "cost_usd": None if cost is None else cost / 1e6, "attempts": [a.__dict__ for a in attempts]}
     try:
         async with gw.sessions() as session:
             session.add(RequestLog(id=request_id, key_id=key.id, route=route, provider=provider, model=model,
                                    outcome=outcome, input_tokens=tokens_in, output_tokens=tokens_out,
-                                   cost_micros=cost, latency_ms=latency_ms))
+                                   cost_micros=cost, latency_ms=latency_ms, attempts=len(calls)))
             await session.commit()
     except Exception as exc:  # noqa: BLE001
         line["ledger_error"] = type(exc).__name__

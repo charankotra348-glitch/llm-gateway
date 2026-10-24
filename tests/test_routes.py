@@ -26,5 +26,5 @@ def test_bad_route_files_fail_at_startup(data, msg):
 
 def test_shipped_routes_file_loads(tmp_path):
     gw = build_gateway(Settings(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path}/x.db"))
-    assert gw.routes.names() == ["demo"] and set(gw.providers) == {"fake"}
+    assert gw.routes.names() == ["demo", "resilient"] and set(gw.providers) == {"fake", "flaky"}
     assert gw.unpriced_targets() == []

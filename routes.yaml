@@ -1,7 +1,12 @@
-# Model names clients send -> provider models, in fallback order (fallback arrives Day 3).
+# Model names clients send -> provider models, tried in order until one answers.
 # A route may only use providers that are configured (see .env.example).
 routes:
   demo:
+    - provider: fake
+      model: fake-echo
+  resilient:                     # demo of fallback: "flaky" fails half its calls, "fake" catches them
+    - provider: flaky
+      model: flaky-echo
     - provider: fake
       model: fake-echo
   # fast:

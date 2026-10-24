@@ -1,7 +1,8 @@
 """A provider that never leaves the process: for tests, local development and load tests.
 
 `latency_s` and `failure_rate` let the load and chaos tests (Day 6) shape its behaviour;
-`seed` makes failures reproducible.
+`seed` makes failures reproducible. `script` is a queue of exceptions to raise on the next calls,
+one per call, for tests that need an exact sequence ("fail, fail, then answer").
 """
 
 import asyncio
@@ -15,15 +16,18 @@ class FakeProvider:
     name = "fake"
 
     def __init__(self, *, reply: str | None = None, latency_s: float = 0.0, failure_rate: float = 0.0,
-                 seed: int | None = None):
+                 seed: int | None = None, script: list[Exception] | None = None):
         self.reply = reply
         self.latency_s = latency_s
         self.failure_rate = failure_rate
         self._random = random.Random(seed)
+        self.script = list(script or [])
         self.calls: list[tuple[str, ChatRequest]] = []
 
     async def complete(self, request: ChatRequest, *, model: str, timeout_s: float) -> Completion:
         self.calls.append((model, request))
+        if self.script:
+            raise self.script.pop(0)
         if self.latency_s > timeout_s:
             await asyncio.sleep(timeout_s)
             raise ProviderTimeout(f"fake provider took longer than {timeout_s}s")

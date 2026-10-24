@@ -1,6 +1,6 @@
 """Errors, and how each one reaches the client in OpenAI's error format.
 
-Provider errors say whether retrying could help (`retryable`); the fallback logic (Day 3)
+Provider errors say whether retrying could help (`retryable`); the fallback logic (resilience.py)
 uses that. The HTTP status tells the client whose fault it was: 4xx = the request,
 5xx = the gateway or a provider behind it.
 """

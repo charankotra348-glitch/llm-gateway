@@ -2,7 +2,7 @@
 # Checked 2026-10-23. Verify against the providers' pricing pages before relying on them:
 #   https://ai.google.dev/gemini-api/docs/pricing   https://aws.amazon.com/bedrock/pricing/
 # Gemini bills thinking tokens as output; the Gemini adapter already counts them as output tokens.
-free_providers: [fake, ollama]     # run locally: cost is recorded as 0
+free_providers: [fake, flaky, ollama]     # run locally: cost is recorded as 0
 prices:
   gemini:
     gemini-2.5-flash: {input_per_mtok: 0.30, output_per_mtok: 2.50}

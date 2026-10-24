@@ -37,11 +37,12 @@ class RequestLog(Base):
     id: Mapped[str] = mapped_column(String(48), primary_key=True)        # the chatcmpl-... id returned
     key_id: Mapped[str] = mapped_column(ForeignKey("api_keys.id"))
     route: Mapped[str] = mapped_column(String(100))
-    provider: Mapped[str] = mapped_column(String(20))
+    provider: Mapped[str] = mapped_column(String(20))       # the one that answered, or the last one tried
     model: Mapped[str] = mapped_column(String(100))
     outcome: Mapped[str] = mapped_column(String(40))                     # ok | an error code
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_micros: Mapped[int | None] = mapped_column(BigInteger, nullable=True)   # None = not priced
     latency_ms: Mapped[float] = mapped_column(Float)
+    attempts: Mapped[int] = mapped_column(Integer, default=1, server_default="1")   # provider calls made
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

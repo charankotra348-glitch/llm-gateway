@@ -4,7 +4,7 @@
       fast:                       # what clients send as "model"
         - provider: gemini
           model: gemini-2.5-flash
-        - provider: bedrock       # fallback order (used from Day 3)
+        - provider: bedrock       # tried next if gemini fails
           model: us.amazon.nova-2-lite-v1:0
 """
 

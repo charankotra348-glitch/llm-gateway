@@ -17,7 +17,7 @@ reply = client.chat.completions.create(model="demo", messages=[{"role": "user", 
 |---|---|---|
 | 1 | OpenAI-compatible `/v1/chat/completions` and `/v1/models`, adapters for Gemini, Bedrock, Ollama and a fake provider, OpenAI-format errors | done |
 | 2 | API keys, Postgres request ledger with cost estimates, per-key monthly budgets, `/v1/usage` | done |
-| 3 | Timeouts, retries, fallback across a route's targets, circuit breaker | |
+| 3 | Timeouts, retries, fallback across a route's targets, circuit breakers, `/v1/status` | done |
 | 4 | Rate limits, response cache | |
 | 5 | Streaming, PII redaction | |
 | 6 | Load, chaos and cache benchmarks | |
@@ -34,13 +34,16 @@ python -m gateway.keys create --name my-app --budget 5    # prints the key once
 uvicorn gateway.main:app --reload
 ```
 
-Keys: `python -m gateway.keys list` and `python -m gateway.keys revoke <prefix>`. A key's spend this month:
+Keys: `python -m gateway.keys list` and `python -m gateway.keys revoke <prefix>`. A key's spend this month, and the circuit breaker state of each provider:
 
 ```bash
 curl -H "Authorization: Bearer gw_..." localhost:8000/v1/usage
+curl -H "Authorization: Bearer gw_..." localhost:8000/v1/status
 ```
 
-`routes.yaml` maps the model names clients send to provider models. The first target serves the request. From Day 3, the later targets are the fallback order:
+The shipped `resilient` route shows fallback with no API keys. Its first target, `flaky`, fails half its calls, and `fake` catches them. Send it 20 requests: all succeed, `x-gateway-provider` shows who answered, and `/v1/status` shows `flaky`'s circuit open.
+
+`routes.yaml` maps the model names clients send to provider models. Targets are tried in order until one answers:
 
 ```yaml
 routes:
@@ -53,14 +56,32 @@ routes:
 
 The gateway refuses to start if a route names a provider that isn't configured. A typo shows up at boot, not as an error on the first request.
 
+## When a provider fails
+
+| What went wrong | What the gateway does | Why |
+|---|---|---|
+| Provider down (5xx, connection refused) | Retry the same target with jittered backoff (2 tries by default), then the next target | Often a blip; a second try is cheap |
+| Timeout | Next target immediately | A retry would wait just as long again |
+| Provider rate limit (429) | Next target immediately | A retry would be throttled again |
+| Gateway's provider credentials rejected | Next target immediately | This target is misconfigured; others may be fine |
+| Provider rejects the request (bad input) | Stop and return the error | Another provider would most likely reject it too |
+
+Each target (provider + model) has a **circuit breaker**. After 5 consecutive failures (`BREAKER_THRESHOLD`) its circuit opens, and requests skip it without paying a timeout to rediscover the outage. After 30 s (`BREAKER_COOLDOWN_S`) one request is let through as a probe: if it succeeds the circuit closes, if not it stays open for another cooldown.
+
+Two clocks bound every request. Each provider call gets `REQUEST_TIMEOUT_S`, enforced on the wall clock as well as by the HTTP client: an HTTP read timeout is per chunk, so a provider trickling bytes could otherwise run past it. The whole request, across retries and fallbacks, gets `TOTAL_TIMEOUT_S`.
+
+The client sees one normal response. `x-gateway-provider` says who answered and `x-gateway-attempts` how many provider calls it took; the ledger records the same. If every target fails, the error says what each one returned, with the status of the last.
+
+Limits worth knowing: breaker state lives in each server process, so replicas learn about an outage separately (shared state, such as Redis, would fix that), and a retry after a timeout can't know whether the provider is still generating, and billing, the first answer.
+
 ## Design choices
 
 - **The provider-neutral request is the only thing adapters see.** The wire format goes through `normalize()` once. A new provider never has to deal with OpenAI quirks such as `developer` messages, `max_completion_tokens` or a `stop` given as a string.
 - **Unsupported options are refused with a 400, not ignored.** `n>1`, `json_schema`, tool calls, images and (until Day 5) streaming fail loudly. A client that silently got one choice instead of three would be a worse bug.
 - **Token counts are never invented.** If a provider doesn't report usage, `usage` is `null`. Costs built on usage are labeled as estimates.
-- **Errors keep OpenAI's shape, and the status shows whose fault it was.** 4xx means the request was wrong. 502 or 504 means a provider failed. Every provider error records whether a retry could help, which is what fallback (Day 3) uses. Provider error text never echoes the gateway's credentials.
+- **Errors keep OpenAI's shape, and the status shows whose fault it was.** 4xx means the request was wrong. 502 or 504 means a provider failed. Every provider error records whether a retry could help, which the fallback policy uses. Provider error text never echoes the gateway's credentials.
 - **API keys are stored only as SHA-256 hashes.** A leaked database doesn't leak usable keys, and a key is shown once, when it's created. Plain SHA-256 is enough because keys are 256-bit random values; password hashing (bcrypt and similar) exists for low-entropy secrets.
-- **Every accepted request is a ledger row,** successes and provider failures alike, with the provider's own token counts and an estimated cost. Requests rejected before reaching a provider (bad key, unknown model, invalid options) are not recorded. Money is stored as integer micro-dollars, so sums are exact.
+- **Every request that reaches a provider is a ledger row,** successes and failures alike, with who answered, how many calls it took, the provider's own token counts and an estimated cost. Requests turned away before any provider call (bad key, unknown model, invalid options, every circuit open) are not recorded. Money is stored as integer micro-dollars, so sums are exact.
 - **Budgets are monthly (UTC) and soft.** The check runs before each request against the month's recorded spend. Requests already in flight can take a key slightly past its limit, bounded by concurrency times the cost of one request. A hard limit would need a reservation per request; that's a deliberate trade-off.
 - **Budget errors are 429s the client won't retry.** The OpenAI SDKs retry every 429 by default, so every error carries `x-should-retry`: `false` for budgets and bad requests, `true` for provider timeouts, rate limits and outages.
 - **Unpriced requests are visible, not hidden.** Requests with no reported usage, or to a model missing from `prices.yaml`, get no cost (not $0). They don't count toward the budget, `/v1/usage` reports how many there were, and the gateway warns at startup about any route target it can't price.

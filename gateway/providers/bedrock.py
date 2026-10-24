@@ -78,7 +78,8 @@ class BedrockProvider:
 
         client = self._client_for(timeout_s)
         try:
-            response = await anyio.to_thread.run_sync(lambda: client.converse(**kwargs))
+            # abandon_on_cancel: the gateway's own deadline can give up on the thread instead of waiting for it
+            response = await anyio.to_thread.run_sync(lambda: client.converse(**kwargs), abandon_on_cancel=True)
         except ClientError as exc:
             raise _error_for(exc) from exc
         except (ReadTimeoutError, ConnectTimeoutError) as exc:
