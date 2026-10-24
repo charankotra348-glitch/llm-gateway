@@ -66,7 +66,7 @@ Measured with `python -m bench.run` on a 2-vCPU cloud machine (Intel(R) Xeon(R) 
 | Key limited to 30 requests/min sends 90 | 90 allowed | 30 allowed |
 | 60 identical requests in flight (500 ms provider) | 3 provider calls with coalescing (60 without) | 1 provider call |
 | Provider hangs, breakers open after 5 timeouts | 15 requests waited out the timeout | 6 |
-| Added latency, one request at a time | 2.1 ms | 2.3 ms |
+| Added latency, one request at a time | 0.8 ms | 1.1 ms |
 
 **How the overhead came down.** Timing each part (the same 1,000 requests with the key lookup cached, then with the ledger write removed) showed the gateway's own logic took about 0.6 ms; the rest was two database round trips per request, the API-key lookup and the ledger insert. Valid keys are now cached for 30 s (`KEY_CACHE_TTL_S`) and ledger rows are written by a background task in batches (`LEDGER_BATCHED`). Both are trade-offs, listed under design choices.
 
