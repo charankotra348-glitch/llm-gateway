@@ -20,11 +20,14 @@ class Settings(BaseSettings):
     cache_ttl_s: float = 3600                # response cache (temperature-0 requests only); 0 = off
     cache_max_entries: int = 10_000
 
+    redact_pii: bool = True                  # replace personal data and secrets before prompts reach a provider
+
     gemini_api_key: str = ""
     bedrock_region: str = ""          # empty = Bedrock not configured
     ollama_url: str = ""              # e.g. http://localhost:11434; empty = not configured
     enable_fake: bool = True          # in-process fakes for demos and tests: "fake" and "flaky"
     flaky_failure_rate: float = 0.5   # share of calls the "flaky" fake fails, to demo fallback
+    fake_chunk_delay_s: float = 0.05  # pause between streamed words from the fakes, so streaming is visible
 
 
 @lru_cache

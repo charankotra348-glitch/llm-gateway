@@ -19,7 +19,7 @@ reply = client.chat.completions.create(model="demo", messages=[{"role": "user", 
 | 2 | API keys, Postgres request ledger with cost estimates, per-key monthly budgets, `/v1/usage` | done |
 | 3 | Timeouts, retries, fallback across a route's targets, circuit breakers, `/v1/status` | done |
 | 4 | Per-key rate limits, response cache | done |
-| 5 | Streaming, PII redaction | |
+| 5 | Streaming (`stream=true`), redaction of personal data and secrets | done |
 | 6 | Load, chaos and cache benchmarks | |
 | 7 | Deploy, demo, "why not LiteLLM" | |
 
@@ -88,10 +88,26 @@ Limits worth knowing: breaker state lives in each server process, so replicas le
 
 Both keep their state in the server process, like the circuit breakers: with several replicas each has its own buckets and cache, so the effective limit is `rpm × replicas`. Redis would make them shared.
 
+## Streaming
+
+`stream=true` works with every provider (Gemini over server-sent events, Ollama's line-by-line JSON, Bedrock's `ConverseStream`) and comes back in OpenAI's chunk format, so `for chunk in client.chat.completions.create(..., stream=True)` just works. `stream_options={"include_usage": true}` adds a final chunk with token counts.
+
+The failure policy applies until the first chunk arrives: a provider that errors or stays silent past `REQUEST_TIMEOUT_S` is failed over like any request, and the client sees a normal HTTP response from whichever provider answered. Once text has been sent, switching providers would mean starting the answer again, so a failure after that point ends the stream with an error event, which the OpenAI SDK raises as an `APIError`. A provider that stops sending for longer than `REQUEST_TIMEOUT_S` is cut off.
+
+Every stream gets a ledger row when it ends: `ok`, the error code, or `client_disconnected` if the client hung up. A stream only counts as a success for the circuit breaker when it finishes, so a provider that keeps breaking halfway through still trips it. Streams skip the response cache.
+
+## Personal data and secrets
+
+With `REDACT_PII=true` (the default), emails, card numbers (Luhn-checked), US Social Security numbers, phone numbers, IPv4 addresses and common API key formats are replaced with placeholders such as `[EMAIL_1]` before a prompt is sent to any provider. The provider writes its answer with the placeholders, and the gateway puts the real values back before the client sees it, in streams too, where a placeholder can arrive split across chunks.
+
+The same value gets the same placeholder throughout a request, so the model can still tell two people apart. The mapping lives in memory for one request and is never stored. `x-gateway-redactions` and the ledger's `redactions` column say how many values were hidden; the log line records the kinds and counts, never the values.
+
+It's pattern-based, so it doesn't catch names or street addresses (that needs a trained recognizer), and it doesn't scan what a model writes on its own.
+
 ## Design choices
 
 - **The provider-neutral request is the only thing adapters see.** The wire format goes through `normalize()` once. A new provider never has to deal with OpenAI quirks such as `developer` messages, `max_completion_tokens` or a `stop` given as a string.
-- **Unsupported options are refused with a 400, not ignored.** `n>1`, `json_schema`, tool calls, images and (until Day 5) streaming fail loudly. A client that silently got one choice instead of three would be a worse bug.
+- **Unsupported options are refused with a 400, not ignored.** `n>1`, `json_schema`, tool calls and images fail loudly. A client that silently got one choice instead of three would be a worse bug.
 - **Token counts are never invented.** If a provider doesn't report usage, `usage` is `null`. Costs built on usage are labeled as estimates.
 - **Errors keep OpenAI's shape, and the status shows whose fault it was.** 4xx means the request was wrong. 502 or 504 means a provider failed. Every provider error records whether a retry could help, which the fallback policy uses. Provider error text never echoes the gateway's credentials.
 - **API keys are stored only as SHA-256 hashes.** A leaked database doesn't leak usable keys, and a key is shown once, when it's created. Plain SHA-256 is enough because keys are 256-bit random values; password hashing (bcrypt and similar) exists for low-entropy secrets.

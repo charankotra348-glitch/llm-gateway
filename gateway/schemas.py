@@ -27,6 +27,12 @@ class ResponseFormat(BaseModel):
     type: Literal["text", "json_object", "json_schema"] = "text"
 
 
+class StreamOptions(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -39,6 +45,7 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     n: int = 1
     stream: bool = False
+    stream_options: StreamOptions | None = None
     response_format: ResponseFormat | None = None
 
 
@@ -79,6 +86,21 @@ class Completion(BaseModel):
     finish_reason: FinishReason = "stop"
     input_tokens: int | None = None
     output_tokens: int | None = None
+
+
+class Chunk(BaseModel):
+    """One piece of a streamed answer. Providers yield text chunks, then exactly one final chunk
+    with `finish_reason` set (and the token counts, when the provider reports them)."""
+
+    text: str = ""
+    finish_reason: FinishReason | None = None
+    model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    @property
+    def final(self) -> bool:
+        return self.finish_reason is not None
 
 
 def _text_of(message: WireMessage) -> str:

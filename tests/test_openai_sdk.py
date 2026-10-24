@@ -64,7 +64,6 @@ def test_bad_request_is_400_in_openai_shape(sdk):
 
 @pytest.mark.parametrize("kwargs, needle", [
     ({"n": 2}, "n must be 1"),
-    ({"stream": True}, "stream"),
     ({"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {}}}}, "json_schema"),
 ])
 def test_unsupported_options_are_refused_not_ignored(sdk, kwargs, needle):

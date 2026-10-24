@@ -46,4 +46,5 @@ class RequestLog(Base):
     cost_micros: Mapped[int | None] = mapped_column(BigInteger, nullable=True)   # None = not priced
     latency_ms: Mapped[float] = mapped_column(Float)
     attempts: Mapped[int] = mapped_column(Integer, default=1, server_default="1")   # provider calls made
+    redactions: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # values hidden from provider
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

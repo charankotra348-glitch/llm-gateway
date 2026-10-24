@@ -10,13 +10,17 @@ The policy, by what went wrong with one target:
 
 A circuit breaker per target stops sending traffic to one that keeps failing, so requests stop
 paying a timeout each to discover what the last request already found out.
+
+Streams follow the same policy up to their first chunk. After that the client has started
+receiving an answer, so a failure can no longer be hidden by switching providers: it ends the
+stream with an error.
 """
 
 import random
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import anyio
 
@@ -29,7 +33,7 @@ from gateway.errors import (
 )
 from gateway.providers.base import Provider
 from gateway.routes import Route, Target
-from gateway.schemas import ChatRequest, Completion
+from gateway.schemas import ChatRequest, Chunk, Completion
 
 State = Literal["closed", "open", "half_open"]
 
@@ -109,6 +113,62 @@ class Result:
         return sum(a.outcome != "circuit_open" for a in self.attempts)
 
 
+@dataclass
+class StreamResult:
+    """A stream that has produced its first chunk. Iterate `chunks()` for the whole answer."""
+
+    target: Target
+    attempts: list[Attempt]
+    _first: Chunk
+    _rest: AsyncIterator[Chunk]
+    _breaker: CircuitBreaker
+    _idle_timeout_s: float
+    _deadline: float
+    _clock: Callable[[], float]
+
+    @property
+    def calls(self) -> int:
+        return sum(a.outcome != "circuit_open" for a in self.attempts)
+
+    async def chunks(self) -> AsyncIterator[Chunk]:
+        """Yields every chunk. Raises a ProviderError if the stream breaks, stalls for longer than the
+        per-call timeout, or runs past the request's deadline.
+
+        The circuit breaker hears about the target only now: a stream that starts but always breaks
+        halfway is a failing target, so success is counted when the stream finishes."""
+        settled = False
+        try:
+            yield self._first
+            if self._first.final:
+                settled = True
+                self._breaker.success()
+                return
+            while True:
+                wait = min(self._idle_timeout_s, self._deadline - self._clock())
+                if wait <= 0:
+                    raise ProviderTimeout("the answer did not finish within the request's time limit")
+                try:
+                    with anyio.fail_after(wait):
+                        chunk = await anext(self._rest)
+                except StopAsyncIteration:
+                    raise ProviderUnavailable(f"{self.target.provider} ended the stream without finishing") from None
+                except TimeoutError:
+                    raise ProviderTimeout(f"{self.target.provider} stopped sending for {wait:.1f}s") from None
+                yield chunk
+                if chunk.final:
+                    settled = True
+                    self._breaker.success()
+                    return
+        except ProviderError:
+            settled = True
+            self._breaker.failure()
+            raise
+        finally:
+            if not settled:             # the client left mid-stream: says nothing about the target
+                self._breaker.release()
+            await _close(self._rest)
+
+
 class Resilience:
     def __init__(self, policy: ResiliencePolicy | None = None, *, clock: Callable[[], float] = time.monotonic,
                  sleep=anyio.sleep, rng: random.Random | None = None):
@@ -132,6 +192,27 @@ class Resilience:
     async def complete(self, route: Route, chat: ChatRequest, providers: dict[str, Provider]) -> Result:
         """Try the route's targets in order. Returns the first answer, or raises the last error with
         every attempt attached as `exc.attempts`."""
+        async def call(provider: Provider, target: Target, timeout_s: float) -> Completion:
+            return await _call(provider, chat, target.model, timeout_s)
+
+        completion, target, attempts, _, _ = await self._run(route, providers, call)
+        return Result(completion, target, attempts)
+
+    async def stream(self, route: Route, chat: ChatRequest, providers: dict[str, Provider]) -> StreamResult:
+        """Like complete(), but a target counts as answering once it sends its first chunk."""
+        async def open_stream(provider: Provider, target: Target, timeout_s: float):
+            return await _open_stream(provider, chat, target.model, timeout_s)
+
+        (first, rest), target, attempts, breaker, deadline = await self._run(route, providers, open_stream,
+                                                                            settle_on_return=False)
+        return StreamResult(target, attempts, first, rest, breaker, self.policy.attempt_timeout_s, deadline,
+                            self._clock)
+
+    async def _run(self, route: Route, providers: dict[str, Provider],
+                   attempt: Callable[[Provider, Target, float], Awaitable[Any]], *, settle_on_return: bool = True):
+        """The failure policy, shared by complete() and stream(). `attempt` makes one call to one
+        target within the timeout it's given. With settle_on_return=False, the caller reports the
+        target's success to its breaker later (streams do, when they finish)."""
         p = self.policy
         deadline = self._clock() + p.total_timeout_s
         attempts: list[Attempt] = []
@@ -149,8 +230,7 @@ class Resilience:
                     raise _fail(ProviderTimeout(f"no answer within {p.total_timeout_s}s"), attempts)
                 started = self._clock()
                 try:
-                    completion = await _call(providers[target.provider], chat, target.model,
-                                             min(p.attempt_timeout_s, remaining))
+                    value = await attempt(providers[target.provider], target, min(p.attempt_timeout_s, remaining))
                 except ProviderRejected as exc:
                     breaker.release()
                     attempts.append(Attempt(target.provider, target.model, exc.code, _ms(self._clock() - started)))
@@ -166,8 +246,9 @@ class Resilience:
                     await self._sleep(min(self._rng.uniform(0, p.backoff_s * 2 ** n), max(0.0, remaining)))
                     continue
                 attempts.append(Attempt(target.provider, target.model, "ok", _ms(self._clock() - started)))
-                breaker.success()
-                return Result(completion, target, attempts)
+                if settle_on_return:
+                    breaker.success()
+                return value, target, attempts, breaker, deadline
 
         if last_error is None:
             raise _fail(ProviderUnavailable("every provider for this model is failing right now (circuit open); "
@@ -184,6 +265,34 @@ async def _call(provider: Provider, chat: ChatRequest, model: str, timeout_s: fl
             return await provider.complete(chat, model=model, timeout_s=timeout_s)
     except TimeoutError:
         raise ProviderTimeout(f"{provider.name} gave no answer within {timeout_s:.1f}s") from None
+
+
+async def _open_stream(provider: Provider, chat: ChatRequest, model: str,
+                       timeout_s: float) -> tuple[Chunk, AsyncIterator[Chunk]]:
+    """Start a stream and wait for its first chunk: until then, failing over is still invisible."""
+    stream = aiter(provider.stream(chat, model=model, timeout_s=timeout_s))
+    try:
+        with anyio.fail_after(timeout_s):
+            first = await anext(stream)
+    except StopAsyncIteration:
+        raise ProviderUnavailable(f"{provider.name} returned an empty stream") from None
+    except TimeoutError:
+        await _close(stream)
+        raise ProviderTimeout(f"{provider.name} sent nothing within {timeout_s:.1f}s") from None
+    except BaseException:
+        await _close(stream)
+        raise
+    return first, stream
+
+
+async def _close(stream: AsyncIterator[Chunk]) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        with anyio.CancelScope(shield=True):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001  (a stream that fails to close has nothing more to give)
+                pass
 
 
 def _fail(exc: GatewayError, attempts: list[Attempt]) -> GatewayError:
