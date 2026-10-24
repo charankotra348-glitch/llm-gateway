@@ -38,6 +38,20 @@ class BudgetExceeded(GatewayError):
     code = "budget_exceeded"
 
 
+class RateLimitExceeded(GatewayError):
+    """This key sent requests faster than its per-minute limit. Retryable: waiting `retry-after` helps."""
+
+    status = 429
+    type = "requests"
+    code = "rate_limit_exceeded"
+    retryable = True
+
+    def __init__(self, message: str, retry_after_s: float):
+        super().__init__(message)
+        self.headers = {"retry-after": str(max(1, round(retry_after_s + 0.5))),
+                        "retry-after-ms": str(max(1, round(retry_after_s * 1000)))}
+
+
 class ModelNotFound(GatewayError):
     status = 404
     type = "invalid_request_error"

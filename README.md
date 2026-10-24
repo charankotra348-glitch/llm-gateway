@@ -18,7 +18,7 @@ reply = client.chat.completions.create(model="demo", messages=[{"role": "user", 
 | 1 | OpenAI-compatible `/v1/chat/completions` and `/v1/models`, adapters for Gemini, Bedrock, Ollama and a fake provider, OpenAI-format errors | done |
 | 2 | API keys, Postgres request ledger with cost estimates, per-key monthly budgets, `/v1/usage` | done |
 | 3 | Timeouts, retries, fallback across a route's targets, circuit breakers, `/v1/status` | done |
-| 4 | Rate limits, response cache | |
+| 4 | Per-key rate limits, response cache | done |
 | 5 | Streaming, PII redaction | |
 | 6 | Load, chaos and cache benchmarks | |
 | 7 | Deploy, demo, "why not LiteLLM" | |
@@ -30,7 +30,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env          # add provider settings; with none, only the fake provider is on
 alembic upgrade head          # create the tables (SQLite by default, Postgres via DATABASE_URL)
-python -m gateway.keys create --name my-app --budget 5    # prints the key once
+python -m gateway.keys create --name my-app --budget 5 --rpm 30   # prints the key once
 uvicorn gateway.main:app --reload
 ```
 
@@ -73,6 +73,20 @@ Two clocks bound every request. Each provider call gets `REQUEST_TIMEOUT_S`, enf
 The client sees one normal response. `x-gateway-provider` says who answered and `x-gateway-attempts` how many provider calls it took; the ledger records the same. If every target fails, the error says what each one returned, with the status of the last.
 
 Limits worth knowing: breaker state lives in each server process, so replicas learn about an outage separately (shared state, such as Redis, would fix that), and a retry after a timeout can't know whether the provider is still generating, and billing, the first answer.
+
+## Rate limits and caching
+
+**Rate limits.** Each key has a requests-per-minute limit (`--rpm` when creating it, otherwise `DEFAULT_RPM`, 60; `0` means none), enforced with a token bucket: a burst of up to `rpm` requests, then one per `60/rpm` seconds. Over the limit is a 429 `rate_limit_exceeded` with `retry-after`, which the OpenAI SDK reads, so a client with retries on waits and carries on without seeing an error. Successful responses carry `x-ratelimit-limit-requests` and `x-ratelimit-remaining-requests`, as OpenAI's do.
+
+**Response cache.** An identical request (same key, route, messages and options) is answered from memory: no provider call, no cost, `x-gateway-cache: hit`, and a ledger row with provider `cache` and cost 0. `/v1/usage` counts the hits.
+
+- Only `temperature: 0` requests are cached. Any other temperature asks for a sample, and replaying one sample would quietly change what the request means; those get `x-gateway-cache: bypass`.
+- Entries belong to one API key. Another key never receives the answer, nor learns from a fast response that someone else asked the same thing.
+- Standard `Cache-Control` works: `no-cache` skips the lookup but stores the fresh answer, `no-store` does neither.
+- Failures are never cached. Entries live for `CACHE_TTL_S` (1 hour), and the least recently used go first past `CACHE_MAX_ENTRIES`.
+- Hits are free, so they're served even when a key's budget is spent; rate limits still count them.
+
+Both keep their state in the server process, like the circuit breakers: with several replicas each has its own buckets and cache, so the effective limit is `rpm × replicas`. Redis would make them shared.
 
 ## Design choices
 

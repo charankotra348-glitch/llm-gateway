@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.models import RequestLog
 
+CACHE_PROVIDER = "cache"        # the ledger's provider for requests answered from the response cache
+
 
 def month_start(now: datetime | None = None) -> datetime:
     now = now or datetime.now(UTC)
@@ -19,15 +21,17 @@ class Usage:
     spend_micros: int
     requests: int
     unpriced_requests: int        # succeeded but could not be priced, so not counted in spend
+    cache_hits: int               # answered from the response cache, at no cost
 
 
 async def month_usage(session: AsyncSession, key_id: str, now: datetime | None = None) -> Usage:
     since = month_start(now)
-    spend, total, unpriced = (await session.execute(
+    spend, total, unpriced, hits = (await session.execute(
         select(
             func.coalesce(func.sum(RequestLog.cost_micros), 0),
             func.count(),
             func.count().filter(RequestLog.cost_micros.is_(None), RequestLog.outcome == "ok"),
+            func.count().filter(RequestLog.provider == CACHE_PROVIDER),
         ).where(RequestLog.key_id == key_id, RequestLog.created_at >= since)
     )).one()
-    return Usage(int(spend), int(total), int(unpriced))
+    return Usage(int(spend), int(total), int(unpriced), int(hits))

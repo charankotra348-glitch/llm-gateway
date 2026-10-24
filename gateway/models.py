@@ -24,6 +24,7 @@ class ApiKey(Base):
     prefix: Mapped[str] = mapped_column(String(16))                      # shown in lists and logs
     key_hash: Mapped[str] = mapped_column(String(64), unique=True)       # sha256 of the key; the key is never stored
     monthly_budget_micros: Mapped[int | None] = mapped_column(BigInteger, nullable=True)   # None = no limit
+    rate_limit_rpm: Mapped[int | None] = mapped_column(Integer, nullable=True)   # None = gateway default; 0 = none
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

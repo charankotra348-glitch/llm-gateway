@@ -98,8 +98,8 @@ def db(database_url):
 
 @pytest.fixture
 def make_key(db):
-    """Create a key in the test database: make_key(budget_usd=None) -> (row, key)."""
-    return lambda name="test", budget_usd=None: db(lambda s: create_key(s, name, budget_usd))
+    """Create a key in the test database: make_key(budget_usd=None, rpm=None) -> (row, key)."""
+    return lambda name="test", budget_usd=None, rpm=None: db(lambda s: create_key(s, name, budget_usd, rpm))
 
 
 @pytest.fixture

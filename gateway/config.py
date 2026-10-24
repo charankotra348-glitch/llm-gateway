@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     breaker_threshold: int = 5               # consecutive failures that open a target's circuit
     breaker_cooldown_s: float = 30.0
 
+    default_rpm: int = 60                    # requests per minute for keys without their own limit; 0 = none
+    cache_ttl_s: float = 3600                # response cache (temperature-0 requests only); 0 = off
+    cache_max_entries: int = 10_000
+
     gemini_api_key: str = ""
     bedrock_region: str = ""          # empty = Bedrock not configured
     ollama_url: str = ""              # e.g. http://localhost:11434; empty = not configured
