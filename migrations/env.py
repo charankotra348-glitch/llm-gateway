@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from gateway import models  # noqa: F401  (registers the tables)
 from gateway.config import get_settings
-from gateway.db import Base
+from gateway.db import Base, normalize_database_url
 
 config = context.config
 if config.config_file_name and config.attributes.get("configure_logger", True):
@@ -14,7 +14,7 @@ if config.config_file_name and config.attributes.get("configure_logger", True):
 
 
 def _url() -> str:
-    return config.attributes.get("database_url") or get_settings().database_url
+    return normalize_database_url(config.attributes.get("database_url") or get_settings().database_url)
 
 
 def _run(connection) -> None:

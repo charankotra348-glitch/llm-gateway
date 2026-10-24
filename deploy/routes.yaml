@@ -1,0 +1,15 @@
+# Routes for the public deployment. Needs GEMINI_API_KEY; the fakes need no keys.
+routes:
+  fast:                          # a real model; falls back to the lighter one if it fails
+    - provider: gemini
+      model: gemini-2.5-flash
+    - provider: gemini
+      model: gemini-2.5-flash-lite
+  demo:                          # instant echo, no key needed, costs nothing
+    - provider: fake
+      model: fake-echo
+  resilient:                     # fallback in action: "flaky" fails half its calls, "fake" catches them
+    - provider: flaky
+      model: flaky-echo
+    - provider: fake
+      model: fake-echo

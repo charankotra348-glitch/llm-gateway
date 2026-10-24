@@ -21,7 +21,29 @@ reply = client.chat.completions.create(model="demo", messages=[{"role": "user", 
 | 4 | Per-key rate limits, response cache | done |
 | 5 | Streaming (`stream=true`), redaction of personal data and secrets | done |
 | 6 | Load, chaos and cache benchmarks; key cache and batched ledger writes | done |
-| 7 | Deploy, demo, "why not LiteLLM" | |
+| 7 | Docker image, Render + Neon deployment, "why not LiteLLM" | done |
+
+## How a request flows
+
+```mermaid
+flowchart TD
+    C[Client: any OpenAI SDK] -->|POST /v1/chat/completions| A[Key check<br/>cached 30 s]
+    A --> R[Rate limit<br/>token bucket per key]
+    R --> N[Route lookup + normalize]
+    N --> K{Cache hit?<br/>temperature 0, per key}
+    K -->|yes| L
+    K -->|no| B[Budget check]
+    B --> P[Redact personal data]
+    P --> F[Try targets in order<br/>retries, fallback, circuit breakers]
+    F --> G[Gemini]
+    F --> W[Bedrock]
+    F --> O[Ollama]
+    G & W & O --> U[Restore redacted values]
+    U --> L[Ledger row, queued<br/>written in batches]
+    L --> C
+```
+
+Each check can end the request early with an OpenAI-format error (400, 401, 404, 429, 502, 504).
 
 ## Benchmarks
 
@@ -118,6 +140,52 @@ With `REDACT_PII=true` (the default), emails, card numbers (Luhn-checked), US So
 The same value gets the same placeholder throughout a request, so the model can still tell two people apart. The mapping lives in memory for one request and is never stored. `x-gateway-redactions` and the ledger's `redactions` column say how many values were hidden; the log line records the kinds and counts, never the values.
 
 It's pattern-based, so it doesn't catch names or street addresses (that needs a trained recognizer), and it doesn't scan what a model writes on its own.
+
+## Deploy
+
+The repo carries a production `Dockerfile` (non-root, migrations on start, one worker) and a Render Blueprint (`render.yaml`). CI builds the image and sends it a real request on every push. The database is Postgres on Neon's free tier.
+
+1. **Database.** Create a project at [neon.com](https://neon.com) and copy its connection string as Neon gives it (`postgresql://...?sslmode=require&channel_binding=require`); the gateway translates it for its async driver.
+2. **Tables and a key**, from your laptop:
+   ```bash
+   export DATABASE_URL='postgresql://...'        # the Neon string
+   alembic upgrade head
+   python -m gateway.keys create --name demo --budget 2 --rpm 20
+   ```
+3. **Service.** On [render.com](https://render.com): New, Blueprint, pick this repo, and fill in `DATABASE_URL` and `GEMINI_API_KEY` when asked. The deployment serves `deploy/routes.yaml`: `fast` (Gemini 2.5 Flash, falling back to Flash-Lite), `demo` and `resilient`.
+4. **Try it:**
+   ```bash
+   curl https://<your-service>.onrender.com/v1/chat/completions \
+     -H "Authorization: Bearer gw_..." -H "content-type: application/json" \
+     -d '{"model": "fast", "messages": [{"role": "user", "content": "Say hi in five words"}]}'
+   ```
+
+Render's free plan sleeps after about 15 idle minutes, so the first request after that takes around a minute. On shutdown the gateway drains its ledger queue before exiting. Keys are created from a laptop against the same database; there is no admin API on purpose, which keeps the public surface to the OpenAI endpoints.
+
+**A guided tour** for a demo or a recording: `python scripts/demo.py --base-url https://<your-service>.onrender.com --key gw_... --model fast` streams a real answer, sends 20 requests through the flaky route and shows the circuit breaker open, shows what the provider saw after redaction, answers a repeat question from the cache, and prints the key's usage. It pauses before each step; `--no-pause` runs straight through.
+
+To run the image locally: `docker build -t llm-gateway . && docker run -p 8000:8000 llm-gateway` (SQLite inside the container), then create a key with `docker exec <container> python -m gateway.keys create --name local`.
+
+## Why not just use LiteLLM?
+
+For production, I would. [LiteLLM](https://github.com/BerriAI/litellm) is a mature open-source gateway: 100+ providers behind one OpenAI-compatible API, virtual keys with budgets and rate limits, fallbacks with cooldowns, caching, guardrails including PII masking, spend tracking in Postgres and an admin UI. Hosted gateways cover similar ground. This project isn't trying to replace them.
+
+I built it to learn what such a gateway has to get right, and to measure it:
+
+- **The failure policy is the product.** Which errors deserve a retry on the same provider, which a switch to the next one, and which neither (a rejected request fails everywhere). And how that changes once a stream has sent its first token, when switching providers is no longer invisible.
+- **A circuit breaker is about latency as much as availability.** During a hang, fallback alone kept every request succeeding but each one waited out the timeout first; the breaker took mean latency from 1,056 ms to 106 ms.
+- **Overhead hides in I/O, not code.** The gateway's own logic took about 0.6 ms; two database round trips were the other ~5 ms. Fixing that meant trading revocation delay and a few milliseconds of ledger rows on a hard kill for 3× lower overhead, trade-offs worth making knowingly.
+- **Caching LLM output is a correctness question first.** Only temperature-0 requests, and only within one API key.
+
+Knowing this is what makes a tool like LiteLLM configurable with intent: which cooldown and retry settings matter, what to cache, and what to watch in production.
+
+## What I'd add next
+
+- **Request coalescing:** merge identical requests already in flight. The cache benchmark found 27 of 125 provider calls were duplicates of a question already being answered.
+- **Shared state in Redis:** circuit breakers, rate-limit buckets and the cache are per process today, so replicas don't share what they learn.
+- **Token-based rate limits and budgets checked before the call,** using an estimate of the request's tokens, instead of after.
+- **Tool calls and images,** which the gateway refuses today rather than half-supporting.
+- **OpenTelemetry traces** across retries and fallbacks, beyond the JSON log line.
 
 ## Design choices
 

@@ -1,0 +1,16 @@
+# Render Blueprint: New -> Blueprint -> pick this repo. Render asks for the two secrets below.
+services:
+  - type: web
+    name: llm-gateway
+    runtime: docker
+    plan: free                   # sleeps after ~15 min idle; the first request after that takes ~1 min
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL        # Neon connection string, pasted as Neon gives it
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ROUTES_FILE
+        value: deploy/routes.yaml
+      - key: DEFAULT_RPM
+        value: "20"
