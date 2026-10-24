@@ -7,8 +7,8 @@ from gateway.errors import ProviderUnavailable
 
 
 @pytest.fixture
-def sdk(client):
-    return openai.OpenAI(base_url="http://testserver/v1", api_key="unused", http_client=client,
+def sdk(client, api_key):
+    return openai.OpenAI(base_url="http://testserver/v1", api_key=api_key, http_client=client,
                          max_retries=0)
 
 

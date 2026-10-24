@@ -24,6 +24,20 @@ class InvalidRequest(GatewayError):
     code = "invalid_request"
 
 
+class InvalidApiKey(GatewayError):
+    status = 401
+    type = "invalid_request_error"
+    code = "invalid_api_key"
+
+
+class BudgetExceeded(GatewayError):
+    """The key's monthly budget is spent. 429 like OpenAI's insufficient_quota, but never worth retrying."""
+
+    status = 429
+    type = "insufficient_quota"
+    code = "budget_exceeded"
+
+
 class ModelNotFound(GatewayError):
     status = 404
     type = "invalid_request_error"
