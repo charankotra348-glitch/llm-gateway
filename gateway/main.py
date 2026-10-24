@@ -5,6 +5,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 import anyio
 from fastapi import Depends, FastAPI, Request
@@ -16,8 +17,8 @@ from gateway.cache import ResponseCache, plan
 from gateway.config import Settings, get_settings
 from gateway.db import make_engine, make_sessions
 from gateway.errors import BudgetExceeded, GatewayError, InvalidApiKey, InvalidRequest, RateLimitExceeded, error_body
-from gateway.keys import find_key
-from gateway.ledger import CACHE_PROVIDER, month_usage
+from gateway.keys import KeyCache
+from gateway.ledger import CACHE_PROVIDER, LedgerWriter, month_usage
 from gateway.limits import RateLimiter
 from gateway.models import ApiKey, RequestLog
 from gateway.pricing import PriceTable
@@ -43,7 +44,7 @@ class Gateway:
     def __init__(self, providers: dict[str, Provider], routes: RouteTable, sessions: async_sessionmaker,
                  *, prices: PriceTable | None = None, resilience: Resilience | None = None,
                  limiter: RateLimiter | None = None, cache: ResponseCache | None = None, redact_pii: bool = True,
-                 engine=None):
+                 keys: KeyCache | None = None, ledger: LedgerWriter | None = None, engine=None):
         self.providers = providers
         self.routes = routes
         self.sessions = sessions
@@ -53,13 +54,19 @@ class Gateway:
         self.limiter = limiter if limiter is not None else RateLimiter(default_rpm=0)
         self.cache = cache if cache is not None else ResponseCache(ttl_s=0)
         self.redact_pii = redact_pii
+        self.keys = keys if keys is not None else KeyCache(ttl_s=0)
+        self.ledger = ledger if ledger is not None else LedgerWriter(sessions)
         self._engine = engine
 
     def unpriced_targets(self) -> list[str]:
         return [f"{r}: {t.provider}/{t.model}" for r in self.routes.names() for t in self.routes.get(r).targets
                 if not self.prices.knows(t.provider, t.model)]
 
+    async def start(self) -> None:
+        await self.ledger.start()
+
     async def aclose(self) -> None:
+        await self.ledger.stop()                # write out queued rows before anything closes
         for p in self.providers.values():
             await p.aclose()
         if self._engine is not None:
@@ -84,14 +91,16 @@ def build_gateway(settings: Settings) -> Gateway:
         providers["ollama"] = OllamaProvider(settings.ollama_url)
     routes = RouteTable.load(settings.routes_file, known_providers=set(providers))
     engine = make_engine(settings.database_url)
+    sessions = make_sessions(engine)
     policy = ResiliencePolicy(
         attempt_timeout_s=settings.request_timeout_s, total_timeout_s=settings.total_timeout_s,
         attempts_per_target=settings.attempts_per_target, backoff_s=settings.retry_backoff_s,
         breaker_threshold=settings.breaker_threshold, breaker_cooldown_s=settings.breaker_cooldown_s)
-    return Gateway(providers, routes, make_sessions(engine), prices=PriceTable.load(settings.prices_file),
+    return Gateway(providers, routes, sessions, prices=PriceTable.load(settings.prices_file),
                    resilience=Resilience(policy), limiter=RateLimiter(settings.default_rpm),
                    cache=ResponseCache(settings.cache_ttl_s, settings.cache_max_entries),
-                   redact_pii=settings.redact_pii, engine=engine)
+                   redact_pii=settings.redact_pii, keys=KeyCache(settings.key_cache_ttl_s),
+                   ledger=LedgerWriter(sessions, batched=settings.ledger_batched), engine=engine)
 
 
 async def authenticate(request: Request) -> ApiKey:
@@ -100,8 +109,7 @@ async def authenticate(request: Request) -> ApiKey:
     if scheme.lower() != "bearer" or not token:
         raise InvalidApiKey("Missing API key. Send it as 'Authorization: Bearer gw_...'.")
     gw: Gateway = request.app.state.gateway
-    async with gw.sessions() as session:
-        key = await find_key(session, token.strip())
+    key = await gw.keys.find(gw.sessions, token.strip())
     if key is None:
         raise InvalidApiKey("Incorrect or revoked API key.")
     return key
@@ -111,6 +119,7 @@ def create_app(gateway: Gateway | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.gateway = gateway or build_gateway(get_settings())
+        await app.state.gateway.start()
         for target in app.state.gateway.unpriced_targets():
             log.warning(json.dumps({"event": "unpriced_target", "target": target,
                                     "note": "requests here are not counted against budgets"}))
@@ -320,7 +329,8 @@ def _response(request_id: str, completion: Completion, headers: dict[str, str]) 
 async def _record(gw: Gateway, request_id: str, key: ApiKey, route: str, attempts: list[Attempt], outcome: str,
                   completion: Completion | None, *, latency_ms: float, vault: Vault | None = None) -> None:
     """Log line + ledger row. A ledger failure is logged, never turned into a failed response:
-    the provider has already been paid for the answer.
+    the provider has already been paid for the answer. With the batched writer, the row is queued
+    and written in the background.
 
     Requests that never reached a provider (every circuit open) are not recorded."""
     calls = [a for a in attempts if a.outcome != "circuit_open"]
@@ -342,12 +352,11 @@ async def _record(gw: Gateway, request_id: str, key: ApiKey, route: str, attempt
             "cost_usd": None if cost is None else cost / 1e6, "attempts": [a.__dict__ for a in attempts],
             "redacted": dict(vault.counts) if vault else {}}     # kinds and counts only, never the values
     try:
-        async with gw.sessions() as session:
-            session.add(RequestLog(id=request_id, key_id=key.id, route=route, provider=provider, model=model,
-                                   outcome=outcome, input_tokens=tokens_in, output_tokens=tokens_out,
-                                   cost_micros=cost, latency_ms=latency_ms, attempts=0 if cached else len(calls),
-                                   redactions=vault.total if vault else 0))
-            await session.commit()
+        await gw.ledger.write(RequestLog(
+            id=request_id, key_id=key.id, route=route, provider=provider, model=model, outcome=outcome,
+            input_tokens=tokens_in, output_tokens=tokens_out, cost_micros=cost, latency_ms=latency_ms,
+            attempts=0 if cached else len(calls), redactions=vault.total if vault else 0,
+            created_at=datetime.now(UTC)))          # the request's time, not the time a batch is written
     except Exception as exc:  # noqa: BLE001
         line["ledger_error"] = type(exc).__name__
         log.error(json.dumps(line))

@@ -39,3 +39,6 @@ ignore = ["B008"]  # FastAPI Depends() in defaults
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff.lint.per-file-ignores]
+"bench/*" = ["E501"]   # report tables read better on one line

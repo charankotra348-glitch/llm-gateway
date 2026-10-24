@@ -10,10 +10,12 @@ import argparse
 import asyncio
 import hashlib
 import secrets
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from gateway.models import ApiKey
 
@@ -46,6 +48,34 @@ async def find_key(session: AsyncSession, key: str) -> ApiKey | None:
     if row is None or row.revoked_at is not None:
         return None
     return row
+
+
+class KeyCache:
+    """Remembers valid keys for `ttl_s` seconds, so most requests skip the database lookup.
+
+    The cost: a key revoked (or given a new budget or rate limit) keeps its old state in a running
+    gateway for up to `ttl_s`. Unknown keys are never cached, so a new key works at once.
+    `ttl_s=0` turns caching off."""
+
+    def __init__(self, ttl_s: float = 30, *, max_entries: int = 10_000, clock: Callable[[], float] = time.monotonic):
+        self.ttl_s = ttl_s
+        self.max_entries = max_entries
+        self._clock = clock
+        self._entries: dict[str, tuple[float, ApiKey]] = {}      # key hash -> (expires at, row)
+
+    async def find(self, sessions: async_sessionmaker, key: str) -> ApiKey | None:
+        digest = hash_key(key)
+        if self.ttl_s > 0 and (entry := self._entries.get(digest)) and self._clock() < entry[0]:
+            return entry[1]
+        async with sessions() as session:
+            row = await find_key(session, key)
+        if row is None:
+            self._entries.pop(digest, None)
+        elif self.ttl_s > 0:
+            if len(self._entries) >= self.max_entries:
+                self._entries.pop(next(iter(self._entries)))       # oldest inserted
+            self._entries[digest] = (self._clock() + self.ttl_s, row)
+        return row
 
 
 async def _main(argv=None) -> None:

@@ -20,8 +20,23 @@ reply = client.chat.completions.create(model="demo", messages=[{"role": "user", 
 | 3 | Timeouts, retries, fallback across a route's targets, circuit breakers, `/v1/status` | done |
 | 4 | Per-key rate limits, response cache | done |
 | 5 | Streaming (`stream=true`), redaction of personal data and secrets | done |
-| 6 | Load, chaos and cache benchmarks | |
+| 6 | Load, chaos and cache benchmarks; key cache and batched ledger writes | done |
 | 7 | Deploy, demo, "why not LiteLLM" | |
+
+## Benchmarks
+
+Measured with `python -m bench.run` on a 2-vCPU cloud machine (Intel(R) Xeon(R) Processor @ 2.10GHz), ledger on SQLite, against fake providers so that latency and failures are controlled. Full tables and method: [bench/RESULTS.md](bench/RESULTS.md).
+
+| What | Result |
+|---|---|
+| Time the gateway adds per request | 1.8 ms at p50 (was 6.0 ms before caching key lookups and batching ledger writes) |
+| Throughput, instant provider, 10 concurrent | 784 requests/s (was 192) |
+| Added latency, 200 ms provider, 50 concurrent | 3.0 ms at p50, 69.2 ms at p95 (was 27.4 / 252.0 ms) |
+| Provider failing 30% of calls | 100.0% of requests succeed with retry + fallback, vs 66.4% with no protection |
+| Provider that hangs (1 s timeout) | mean latency 106 ms with the circuit breaker, vs 1056 ms without; 10 of 200 requests waited out the timeout instead of all 200 |
+| Repeat questions, temperature 0 | 87.5% cache hits: 125 provider calls for 1000 requests, hits answered in 2.7 ms vs 304.1 ms |
+
+**How the overhead came down.** Timing each part (the same 1,000 requests with the key lookup cached, then with the ledger write removed) showed the gateway's own logic took about 0.6 ms; the rest was two database round trips per request, the API-key lookup and the ledger insert. Valid keys are now cached for 30 s (`KEY_CACHE_TTL_S`) and ledger rows are written by a background task in batches (`LEDGER_BATCHED`). Both are trade-offs, listed under design choices.
 
 ## Run it
 
@@ -115,7 +130,8 @@ It's pattern-based, so it doesn't catch names or street addresses (that needs a 
 - **Budgets are monthly (UTC) and soft.** The check runs before each request against the month's recorded spend. Requests already in flight can take a key slightly past its limit, bounded by concurrency times the cost of one request. A hard limit would need a reservation per request; that's a deliberate trade-off.
 - **Budget errors are 429s the client won't retry.** The OpenAI SDKs retry every 429 by default, so every error carries `x-should-retry`: `false` for budgets and bad requests, `true` for provider timeouts, rate limits and outages.
 - **Unpriced requests are visible, not hidden.** Requests with no reported usage, or to a model missing from `prices.yaml`, get no cost (not $0). They don't count toward the budget, `/v1/usage` reports how many there were, and the gateway warns at startup about any route target it can't price.
-- **A ledger write that fails is logged and doesn't fail the response.** The provider has already charged for the answer, so throwing it away would cost twice.
+- **Ledger rows are written in the background, in batches.** The response doesn't wait for the database; a background task inserts whatever has queued, so batches grow by themselves under load. A normal shutdown drains the queue; a process killed outright loses the rows still queued (milliseconds' worth). If the database falls behind, the queue fills and requests wait (backpressure) rather than rows being dropped. A batch that keeps failing is retried, then logged and counted. A failed ledger write never fails a response: the provider has already charged for the answer. `LEDGER_BATCHED=false` writes each row before responding.
+- **Valid API keys are cached for 30 s.** Most requests skip the key lookup. The cost: a revoked key, or one given a new budget or rate limit, keeps its old state in a running gateway for up to `KEY_CACHE_TTL_S`. Unknown keys are never cached, so a new key works at once.
 - **Bedrock credentials come from the AWS chain** (an IAM role on AWS, `aws configure` locally), never from gateway settings.
 - **The fake provider is in-process.** It has configurable latency and failure rate and a seed, so tests, demos and the Day 6 chaos tests need no API keys or network.
 
@@ -126,5 +142,7 @@ ruff check . && pytest -q
 ```
 
 `tests/test_openai_sdk.py` drives the gateway with the official `openai` package: success, finish reasons, `/v1/models`, and the SDK exception each error status maps to. The provider tests mock HTTP with `httpx.MockTransport` and Bedrock with botocore's `Stubber`, so no test touches the network.
+
+Benchmarks live in `bench/` and aren't part of `pytest`: `python -m bench.run` (about 4 minutes) rewrites `bench/RESULTS.md` and `bench/results.json`, and `--quick` does a short smoke run.
 
 The test database is built with the real migrations. Tests use SQLite by default. Set `TEST_DATABASE_URL=postgresql+asyncpg://...` to run them on Postgres. CI does both, and also checks that the migrations match the models (`alembic check`).

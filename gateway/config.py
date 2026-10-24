@@ -22,6 +22,9 @@ class Settings(BaseSettings):
 
     redact_pii: bool = True                  # replace personal data and secrets before prompts reach a provider
 
+    key_cache_ttl_s: float = 30              # how long a valid key is trusted without a lookup; 0 = always look up
+    ledger_batched: bool = True              # write ledger rows in the background instead of before responding
+
     gemini_api_key: str = ""
     bedrock_region: str = ""          # empty = Bedrock not configured
     ollama_url: str = ""              # e.g. http://localhost:11434; empty = not configured
