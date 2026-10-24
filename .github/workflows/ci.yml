@@ -19,7 +19,7 @@ jobs:
       - run: pytest -q
 
   postgres:
-    name: Test (Postgres)
+    name: Test (Postgres + Redis)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -31,9 +31,15 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U gw" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       TEST_DATABASE_URL: postgresql+asyncpg://gw:gw@localhost:5432/gateway_test
       DATABASE_URL: postgresql+asyncpg://gw:gw@localhost:5432/gateway_test
+      TEST_REDIS_URL: redis://localhost:6379/1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -63,3 +69,28 @@ jobs:
       - name: Logs
         if: always()
         run: docker logs gw
+
+  cluster:
+    name: Three processes behind nginx
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start nginx, three gateways, Redis and Postgres
+        run: docker compose up -d --build --wait gateway-1 gateway-2 gateway-3 && docker compose up -d nginx
+      - name: One rate limit across all three processes
+        run: |
+          KEY=$(docker compose run --rm migrate python -m gateway.keys create --name ci --rpm 6 | grep -o 'gw_[A-Za-z0-9_-]*' | tail -1)
+          for i in $(seq 30); do curl -fs localhost:8080/healthz && break; sleep 1; done
+          ok=0; limited=0
+          for i in $(seq 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/chat/completions \
+              -H "authorization: Bearer $KEY" -H "content-type: application/json" \
+              -d "{\"model\":\"demo\",\"messages\":[{\"role\":\"user\",\"content\":\"hi $i\"}]}")
+            [ "$code" = 200 ] && ok=$((ok+1)); [ "$code" = 429 ] && limited=$((limited+1))
+          done
+          upstreams=$(for i in $(seq 6); do curl -s -o /dev/null -D - localhost:8080/healthz | grep -i x-upstream; done | sort -u | wc -l)
+          echo "200: $ok  429: $limited  distinct processes: $upstreams"
+          test "$ok" = 6 && test "$limited" = 6 && test "$upstreams" = 3
+      - name: Logs
+        if: always()
+        run: docker compose logs --tail 50

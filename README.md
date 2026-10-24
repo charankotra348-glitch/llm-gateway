@@ -22,6 +22,7 @@ reply = client.chat.completions.create(model="demo", messages=[{"role": "user", 
 | 5 | Streaming (`stream=true`), redaction of personal data and secrets | done |
 | 6 | Load, chaos and cache benchmarks; key cache and batched ledger writes | done |
 | 7 | Docker image, Render + Neon deployment, "why not LiteLLM" | done |
+| 8 | Several processes sharing state through Redis: rate limits, circuit breakers, cache; request coalescing; nginx + 3 gateways in Docker Compose | done |
 
 ## How a request flows
 
@@ -30,7 +31,7 @@ flowchart TD
     C[Client: any OpenAI SDK] -->|POST /v1/chat/completions| A[Key check<br/>cached 30 s]
     A --> R[Rate limit<br/>token bucket per key]
     R --> N[Route lookup + normalize]
-    N --> K{Cache hit?<br/>temperature 0, per key}
+    N --> K{Cache hit, or the same<br/>request already in flight?}
     K -->|yes| L
     K -->|no| B[Budget check]
     B --> P[Redact personal data]
@@ -43,7 +44,7 @@ flowchart TD
     L --> C
 ```
 
-Each check can end the request early with an OpenAI-format error (400, 401, 404, 429, 502, 504).
+Each check can end the request early with an OpenAI-format error (400, 401, 404, 429, 502, 504). With `REDIS_URL` set, rate limits, circuit breakers, the cache and requests in flight are shared by every gateway process.
 
 ## Benchmarks
 
@@ -57,6 +58,15 @@ Measured with `python -m bench.run` on a 2-vCPU cloud machine (Intel(R) Xeon(R) 
 | Provider failing 30% of calls | 100.0% of requests succeed with retry + fallback, vs 66.4% with no protection |
 | Provider that hangs (1 s timeout) | mean latency 106 ms with the circuit breaker, vs 1056 ms without; 10 of 200 requests waited out the timeout instead of all 200 |
 | Repeat questions, temperature 0 | 87.5% cache hits: 125 provider calls for 1000 requests, hits answered in 2.7 ms vs 304.1 ms |
+
+**Across three processes** ([bench/DISTRIBUTED.md](bench/DISTRIBUTED.md)), sharing state through Redis:
+
+| What | Each process alone | Shared through Redis |
+|---|---|---|
+| Key limited to 30 requests/min sends 90 | 90 allowed | 30 allowed |
+| 60 identical requests in flight (500 ms provider) | 3 provider calls with coalescing (60 without) | 1 provider call |
+| Provider hangs, breakers open after 5 timeouts | 15 requests waited out the timeout | 6 |
+| Added latency, one request at a time | 2.1 ms | 2.3 ms |
 
 **How the overhead came down.** Timing each part (the same 1,000 requests with the key lookup cached, then with the ledger write removed) showed the gateway's own logic took about 0.6 ms; the rest was two database round trips per request, the API-key lookup and the ledger insert. Valid keys are now cached for 30 s (`KEY_CACHE_TTL_S`) and ledger rows are written by a background task in batches (`LEDGER_BATCHED`). Both are trade-offs, listed under design choices.
 
@@ -109,7 +119,7 @@ Two clocks bound every request. Each provider call gets `REQUEST_TIMEOUT_S`, enf
 
 The client sees one normal response. `x-gateway-provider` says who answered and `x-gateway-attempts` how many provider calls it took; the ledger records the same. If every target fails, the error says what each one returned, with the status of the last.
 
-Limits worth knowing: breaker state lives in each server process, so replicas learn about an outage separately (shared state, such as Redis, would fix that), and a retry after a timeout can't know whether the provider is still generating, and billing, the first answer.
+With `REDIS_URL` set, breaker state is shared: once any gateway process sees 5 failures in a row, they all skip the target, and a single probe across all of them tests it after the cooldown. One limit worth knowing: a retry after a timeout can't know whether the provider is still generating, and billing, the first answer.
 
 ## Rate limits and caching
 
@@ -123,7 +133,35 @@ Limits worth knowing: breaker state lives in each server process, so replicas le
 - Failures are never cached. Entries live for `CACHE_TTL_S` (1 hour), and the least recently used go first past `CACHE_MAX_ENTRIES`.
 - Hits are free, so they're served even when a key's budget is spent; rate limits still count them.
 
-Both keep their state in the server process, like the circuit breakers: with several replicas each has its own buckets and cache, so the effective limit is `rpm × replicas`. Redis would make them shared.
+**Requests in flight.** If an identical cacheable request is already waiting on a provider, a new one waits for that answer instead of asking again (`x-gateway-cache: coalesced`, recorded like a cache hit). Without this, a burst of the same popular question all misses the cache at once: in the Day 6 benchmark, 27 of 125 provider calls were such duplicates. `COALESCE=false` turns it off.
+
+Without Redis, each process keeps its own buckets, cache and in-flight list, so with several processes a limit of `rpm` becomes `rpm × processes`. See the next section.
+
+## Running as several processes
+
+Set `REDIS_URL` and every gateway process shares:
+
+| State | How it's shared | Why it works across processes |
+|---|---|---|
+| Rate-limit buckets | One token bucket per key in a Redis hash, updated by a Lua script | Redis runs a script atomically, so two processes can't both take the last token; the script uses Redis's clock, so the processes' clocks needn't agree |
+| Circuit breakers | Failure count and open time per target in Redis; the half-open probe is a key set with `SET NX PX` | Every process sees the same state; only one request across all of them can hold the probe, and a probe whose process dies expires by itself |
+| Response cache | One Redis key per entry with a TTL | Redis evicts least-recently-used keys when full (`maxmemory-policy allkeys-lru`) |
+| Requests in flight | The first process to ask takes a short lock (`SET NX PX`); others poll the shared cache for its answer, or take over if it finishes without one | Within a process, followers simply await the leader's future: no Redis traffic |
+
+If Redis is unreachable, the gateway keeps serving on each process's local state instead of failing requests (rate limits and breakers per process, cache misses), and logs `redis_unavailable` at most every 10 s. Keys and the ledger stay in Postgres.
+
+A single Redis is the right size here; a cluster or Redlock (locking across several independent Redis servers) would add operational weight for no gain at this scale.
+
+**Try it with Docker Compose**, which runs nginx in front of three gateway processes, Redis and Postgres:
+
+```bash
+docker compose up -d --build
+docker compose run --rm migrate python -m gateway.keys create --name demo --rpm 30
+curl -i localhost:8080/v1/chat/completions -H "Authorization: Bearer gw_..." -H "content-type: application/json" \
+  -d '{"model": "demo", "messages": [{"role": "user", "content": "hi"}]}'      # X-Upstream: which process answered
+```
+
+CI starts this stack on every push and checks that a key limited to 6 requests a minute gets exactly 6 through nginx, spread over all three processes.
 
 ## Streaming
 
@@ -181,11 +219,11 @@ Knowing this is what makes a tool like LiteLLM configurable with intent: which c
 
 ## What I'd add next
 
-- **Request coalescing:** merge identical requests already in flight. The cache benchmark found 27 of 125 provider calls were duplicates of a question already being answered.
-- **Shared state in Redis:** circuit breakers, rate-limit buckets and the cache are per process today, so replicas don't share what they learn.
 - **Token-based rate limits and budgets checked before the call,** using an estimate of the request's tokens, instead of after.
 - **Tool calls and images,** which the gateway refuses today rather than half-supporting.
 - **OpenTelemetry traces** across retries and fallbacks, beyond the JSON log line.
+- **Redis failover** (Sentinel or a managed Redis). Today a Redis outage degrades to per-process state rather than stopping traffic, but limits loosen until it's back.
+- **Coalescing for streams,** fanning one provider stream out to every identical request instead of only complete answers.
 
 ## Design choices
 
@@ -211,6 +249,8 @@ ruff check . && pytest -q
 
 `tests/test_openai_sdk.py` drives the gateway with the official `openai` package: success, finish reasons, `/v1/models`, and the SDK exception each error status maps to. The provider tests mock HTTP with `httpx.MockTransport` and Bedrock with botocore's `Stubber`, so no test touches the network.
 
-Benchmarks live in `bench/` and aren't part of `pytest`: `python -m bench.run` (about 4 minutes) rewrites `bench/RESULTS.md` and `bench/results.json`, and `--quick` does a short smoke run.
+Benchmarks live in `bench/` and aren't part of `pytest`: `python -m bench.run` (about 4 minutes) rewrites `bench/RESULTS.md` and `bench/results.json`, and `--quick` does a short smoke run. `BENCH_REDIS_URL=redis://localhost:6379/15 python -m bench.distributed` (under a minute) runs three processes and rewrites `bench/DISTRIBUTED.md`.
+
+The Redis tests run against fakeredis, an in-memory stand-in that executes the same Lua scripts; set `TEST_REDIS_URL=redis://...` to run them against a real Redis, as CI does.
 
 The test database is built with the real migrations. Tests use SQLite by default. Set `TEST_DATABASE_URL=postgresql+asyncpg://...` to run them on Postgres. CI does both, and also checks that the migrations match the models (`alembic check`).

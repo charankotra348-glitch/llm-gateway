@@ -161,7 +161,7 @@ async def test_open_circuit_skips_the_target_without_calling_it():
     result = await r.complete(two_targets(), CHAT, {"a": a, "b": b})
     assert len(a.calls) == 2                       # not called: circuit open
     assert [x.outcome for x in result.attempts] == ["circuit_open", "ok"]
-    assert {s["provider"]: s["state"] for s in r.states()} == {"a": "open", "b": "closed"}
+    assert {s["provider"]: s["state"] for s in await r.states()} == {"a": "open", "b": "closed"}
 
 
 async def test_circuit_closes_again_after_a_good_probe():

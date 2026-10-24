@@ -5,7 +5,8 @@ A full bucket allows a short burst of `rpm` requests; after that, requests are s
 rate. That is the usual shape of API rate limits, OpenAI's included.
 
 State lives in this process: with several replicas, each enforces the limit separately, so the
-effective limit is rpm x replicas. Shared state (Redis) would make it exact.
+effective limit is rpm x replicas. With REDIS_URL set, redis_state.RedisRateLimiter runs the same
+bucket in Redis and the limit is exact across replicas.
 """
 
 import math
@@ -45,6 +46,10 @@ class RateLimiter:
         self.default_rpm = default_rpm       # for keys without their own limit; 0 = unlimited
         self._clock = clock
         self._buckets: dict[str, TokenBucket] = {}
+
+    async def take(self, key_id: str, key_rpm: int | None) -> Decision | None:
+        """The interface main.py uses; shared with redis_state.RedisRateLimiter."""
+        return self.check(key_id, key_rpm)
 
     def check(self, key_id: str, key_rpm: int | None) -> Decision | None:
         """None when the key is unlimited."""

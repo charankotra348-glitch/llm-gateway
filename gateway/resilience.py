@@ -20,7 +20,7 @@ import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import anyio
 
@@ -83,6 +83,59 @@ class CircuitBreaker:
         self._probe_in_flight = False
 
 
+class Permit:
+    """Permission from a breaker store to call one target once. `probe` marks the single trial call
+    a half-open breaker lets through; `token` identifies it in a shared store."""
+
+    __slots__ = ("probe", "token")
+
+    def __init__(self, probe: bool = False, token: str | None = None):
+        self.probe, self.token = probe, token
+
+
+class BreakerStore(Protocol):
+    """Where circuit breaker state lives: in this process (LocalBreakers) or shared by every gateway
+    process through Redis (gateway.redis_state.RedisBreakers)."""
+
+    async def allow(self, target: Target) -> Permit | None: ...
+    async def success(self, target: Target, permit: Permit) -> None: ...
+    async def failure(self, target: Target, permit: Permit) -> None: ...
+    async def release(self, target: Target, permit: Permit) -> None: ...
+    async def states(self) -> list[dict]: ...
+
+
+class LocalBreakers:
+    """One CircuitBreaker per target, in this process."""
+
+    def __init__(self, threshold: int = 5, cooldown_s: float = 30.0, clock: Callable[[], float] = time.monotonic):
+        self.threshold, self.cooldown_s, self._clock = threshold, cooldown_s, clock
+        self._breakers: dict[tuple[str, str], CircuitBreaker] = {}
+
+    def get(self, target: Target) -> CircuitBreaker:
+        key = (target.provider, target.model)
+        if key not in self._breakers:
+            self._breakers[key] = CircuitBreaker(self.threshold, self.cooldown_s, clock=self._clock)
+        return self._breakers[key]
+
+    async def allow(self, target: Target) -> Permit | None:
+        breaker = self.get(target)
+        probing = breaker.state == "half_open"
+        return Permit(probe=probing) if breaker.allow() else None
+
+    async def success(self, target: Target, permit: Permit) -> None:
+        self.get(target).success()
+
+    async def failure(self, target: Target, permit: Permit) -> None:
+        self.get(target).failure()
+
+    async def release(self, target: Target, permit: Permit) -> None:
+        self.get(target).release()
+
+    async def states(self) -> list[dict]:
+        return [{"provider": p, "model": m, "state": b.state, "consecutive_failures": b.failures}
+                for (p, m), b in sorted(self._breakers.items())]
+
+
 @dataclass
 class ResiliencePolicy:
     attempt_timeout_s: float = 30.0      # one call to one provider
@@ -121,7 +174,8 @@ class StreamResult:
     attempts: list[Attempt]
     _first: Chunk
     _rest: AsyncIterator[Chunk]
-    _breaker: CircuitBreaker
+    _breakers: BreakerStore
+    _permit: Permit
     _idle_timeout_s: float
     _deadline: float
     _clock: Callable[[], float]
@@ -141,7 +195,7 @@ class StreamResult:
             yield self._first
             if self._first.final:
                 settled = True
-                self._breaker.success()
+                await self._breakers.success(self.target, self._permit)
                 return
             while True:
                 wait = min(self._idle_timeout_s, self._deadline - self._clock())
@@ -157,37 +211,36 @@ class StreamResult:
                 yield chunk
                 if chunk.final:
                     settled = True
-                    self._breaker.success()
+                    await self._breakers.success(self.target, self._permit)
                     return
         except ProviderError:
             settled = True
-            self._breaker.failure()
+            await self._breakers.failure(self.target, self._permit)
             raise
         finally:
-            if not settled:             # the client left mid-stream: says nothing about the target
-                self._breaker.release()
-            await _close(self._rest)
+            with anyio.CancelScope(shield=True):
+                if not settled:             # the client left mid-stream: says nothing about the target
+                    await self._breakers.release(self.target, self._permit)
+                await _close(self._rest)
 
 
 class Resilience:
     def __init__(self, policy: ResiliencePolicy | None = None, *, clock: Callable[[], float] = time.monotonic,
-                 sleep=anyio.sleep, rng: random.Random | None = None):
+                 sleep=anyio.sleep, rng: random.Random | None = None, breakers: BreakerStore | None = None):
         self.policy = policy or ResiliencePolicy()
         self._clock = clock
         self._sleep = sleep
         self._rng = rng or random.Random()
-        self._breakers: dict[tuple[str, str], CircuitBreaker] = {}
+        self.breakers: BreakerStore = breakers if breakers is not None else LocalBreakers(
+            self.policy.breaker_threshold, self.policy.breaker_cooldown_s, clock=clock)
 
     def breaker(self, target: Target) -> CircuitBreaker:
-        key = (target.provider, target.model)
-        if key not in self._breakers:
-            self._breakers[key] = CircuitBreaker(self.policy.breaker_threshold, self.policy.breaker_cooldown_s,
-                                                 clock=self._clock)
-        return self._breakers[key]
+        """The in-process breaker for a target (local store only; for tests and inspection)."""
+        assert isinstance(self.breakers, LocalBreakers), "breaker state is shared in Redis"
+        return self.breakers.get(target)
 
-    def states(self) -> list[dict]:
-        return [{"provider": p, "model": m, "state": b.state, "consecutive_failures": b.failures}
-                for (p, m), b in sorted(self._breakers.items())]
+    async def states(self) -> list[dict]:
+        return await self.breakers.states()
 
     async def complete(self, route: Route, chat: ChatRequest, providers: dict[str, Provider]) -> Result:
         """Try the route's targets in order. Returns the first answer, or raises the last error with
@@ -203,10 +256,10 @@ class Resilience:
         async def open_stream(provider: Provider, target: Target, timeout_s: float):
             return await _open_stream(provider, chat, target.model, timeout_s)
 
-        (first, rest), target, attempts, breaker, deadline = await self._run(route, providers, open_stream,
+        (first, rest), target, attempts, permit, deadline = await self._run(route, providers, open_stream,
                                                                             settle_on_return=False)
-        return StreamResult(target, attempts, first, rest, breaker, self.policy.attempt_timeout_s, deadline,
-                            self._clock)
+        return StreamResult(target, attempts, first, rest, self.breakers, permit, self.policy.attempt_timeout_s,
+                            deadline, self._clock)
 
     async def _run(self, route: Route, providers: dict[str, Provider],
                    attempt: Callable[[Provider, Target, float], Awaitable[Any]], *, settle_on_return: bool = True):
@@ -219,36 +272,39 @@ class Resilience:
         last_error: GatewayError | None = None
 
         for target in route.targets:
-            breaker = self.breaker(target)
-            if not breaker.allow():
+            permit = await self.breakers.allow(target)
+            if permit is None:
                 attempts.append(Attempt(target.provider, target.model, "circuit_open"))
                 continue
             for n in range(p.attempts_per_target):
                 remaining = deadline - self._clock()
                 if remaining <= 0:
-                    breaker.release()
+                    await self.breakers.release(target, permit)
                     raise _fail(ProviderTimeout(f"no answer within {p.total_timeout_s}s"), attempts)
                 started = self._clock()
                 try:
                     value = await attempt(providers[target.provider], target, min(p.attempt_timeout_s, remaining))
                 except ProviderRejected as exc:
-                    breaker.release()
+                    await self.breakers.release(target, permit)
                     attempts.append(Attempt(target.provider, target.model, exc.code, _ms(self._clock() - started)))
                     raise _fail(exc, attempts) from None
                 except ProviderError as exc:
                     attempts.append(Attempt(target.provider, target.model, exc.code, _ms(self._clock() - started)))
-                    breaker.failure()
+                    await self.breakers.failure(target, permit)
                     last_error = exc
-                    retry_here = (isinstance(exc, ProviderUnavailable) and n + 1 < p.attempts_per_target
-                                  and breaker.allow())
-                    if not retry_here:
+                    retry_here = isinstance(exc, ProviderUnavailable) and n + 1 < p.attempts_per_target
+                    if not retry_here or (permit := await self.breakers.allow(target)) is None:
                         break
                     await self._sleep(min(self._rng.uniform(0, p.backoff_s * 2 ** n), max(0.0, remaining)))
                     continue
+                except BaseException:       # cancelled (the client went away): free a probe slot if we held it
+                    with anyio.CancelScope(shield=True):
+                        await self.breakers.release(target, permit)
+                    raise
                 attempts.append(Attempt(target.provider, target.model, "ok", _ms(self._clock() - started)))
                 if settle_on_return:
-                    breaker.success()
-                return value, target, attempts, breaker, deadline
+                    await self.breakers.success(target, permit)
+                return value, target, attempts, permit, deadline
 
         if last_error is None:
             raise _fail(ProviderUnavailable("every provider for this model is failing right now (circuit open); "

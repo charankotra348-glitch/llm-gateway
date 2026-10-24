@@ -13,7 +13,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from gateway.cache import ResponseCache, plan
+from gateway.cache import CachePlan, Entry, ResponseCache, plan
+from gateway.coalesce import Coalescer, Joined, Lead
 from gateway.config import Settings, get_settings
 from gateway.db import make_engine, make_sessions
 from gateway.errors import BudgetExceeded, GatewayError, InvalidApiKey, InvalidRequest, RateLimitExceeded, error_body
@@ -38,13 +39,15 @@ if not log.handlers:            # one JSON line per request on stdout, whatever 
 
 
 class Gateway:
-    """Everything a request needs: providers, routes, prices, the database, and the in-process state
-    (circuit breakers, rate-limit buckets, the response cache)."""
+    """Everything a request needs: providers, routes, prices, the database, and the state that is
+    in-process or shared through Redis (circuit breakers, rate-limit buckets, the response cache,
+    requests in flight)."""
 
     def __init__(self, providers: dict[str, Provider], routes: RouteTable, sessions: async_sessionmaker,
                  *, prices: PriceTable | None = None, resilience: Resilience | None = None,
                  limiter: RateLimiter | None = None, cache: ResponseCache | None = None, redact_pii: bool = True,
-                 keys: KeyCache | None = None, ledger: LedgerWriter | None = None, engine=None):
+                 keys: KeyCache | None = None, ledger: LedgerWriter | None = None,
+                 coalescer: Coalescer | None = None, redis=None, engine=None):
         self.providers = providers
         self.routes = routes
         self.sessions = sessions
@@ -56,6 +59,8 @@ class Gateway:
         self.redact_pii = redact_pii
         self.keys = keys if keys is not None else KeyCache(ttl_s=0)
         self.ledger = ledger if ledger is not None else LedgerWriter(sessions)
+        self.coalescer = coalescer if coalescer is not None else Coalescer()
+        self._redis = redis
         self._engine = engine
 
     def unpriced_targets(self) -> list[str]:
@@ -69,6 +74,8 @@ class Gateway:
         await self.ledger.stop()                # write out queued rows before anything closes
         for p in self.providers.values():
             await p.aclose()
+        if self._redis is not None:
+            await self._redis.aclose()
         if self._engine is not None:
             await self._engine.dispose()
 
@@ -96,11 +103,24 @@ def build_gateway(settings: Settings) -> Gateway:
         attempt_timeout_s=settings.request_timeout_s, total_timeout_s=settings.total_timeout_s,
         attempts_per_target=settings.attempts_per_target, backoff_s=settings.retry_backoff_s,
         breaker_threshold=settings.breaker_threshold, breaker_cooldown_s=settings.breaker_cooldown_s)
+    shared: dict = {}
+    redis = None
+    if settings.redis_url:
+        from redis.asyncio import Redis
+
+        from gateway.redis_state import RedisBreakers, RedisRateLimiter, RedisResponseCache
+        redis = Redis.from_url(settings.redis_url, socket_timeout=1.0, socket_connect_timeout=1.0)
+        shared = {"limiter": RedisRateLimiter(redis, settings.default_rpm),
+                  "cache": RedisResponseCache(redis, settings.cache_ttl_s),
+                  "resilience": Resilience(policy, breakers=RedisBreakers(
+                      redis, settings.breaker_threshold, settings.breaker_cooldown_s))}
     return Gateway(providers, routes, sessions, prices=PriceTable.load(settings.prices_file),
-                   resilience=Resilience(policy), limiter=RateLimiter(settings.default_rpm),
-                   cache=ResponseCache(settings.cache_ttl_s, settings.cache_max_entries),
+                   resilience=shared.get("resilience") or Resilience(policy),
+                   limiter=shared.get("limiter") or RateLimiter(settings.default_rpm),
+                   cache=shared.get("cache") or ResponseCache(settings.cache_ttl_s, settings.cache_max_entries),
                    redact_pii=settings.redact_pii, keys=KeyCache(settings.key_cache_ttl_s),
-                   ledger=LedgerWriter(sessions, batched=settings.ledger_batched), engine=engine)
+                   ledger=LedgerWriter(sessions, batched=settings.ledger_batched),
+                   coalescer=Coalescer(redis, enabled=settings.coalesce), redis=redis, engine=engine)
 
 
 async def authenticate(request: Request) -> ApiKey:
@@ -157,7 +177,7 @@ def create_app(gateway: Gateway | None = None) -> FastAPI:
     async def status(request: Request, key: ApiKey = Depends(authenticate)):
         """Circuit breaker state of every target that has been called. Not part of the OpenAI API."""
         gw: Gateway = request.app.state.gateway
-        return {"targets": gw.resilience.states()}
+        return {"targets": await gw.resilience.states()}
 
     @app.get("/v1/usage")
     async def usage(request: Request, key: ApiKey = Depends(authenticate)):
@@ -177,7 +197,7 @@ def create_app(gateway: Gateway | None = None) -> FastAPI:
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         started = time.perf_counter()
 
-        limit = gw.limiter.check(key.id, key.rate_limit_rpm)
+        limit = await gw.limiter.take(key.id, key.rate_limit_rpm)
         if limit is not None and not limit.allowed:
             raise RateLimitExceeded(f"Rate limit of {limit.limit} requests per minute reached for this key. "
                                     f"Try again in {limit.retry_after_s:.1f}s.", limit.retry_after_s)
@@ -193,52 +213,83 @@ def create_app(gateway: Gateway | None = None) -> FastAPI:
         # Streams skip the cache: an answer is cached once it is complete, and a stream is consumed as it goes.
         cache = plan(key.id, route.name, chat, request.headers.get("cache-control")) \
             if gw.cache.enabled and not body.stream else None
-        if cache and cache.read and (hit := gw.cache.get(cache.key)) is not None:
-            completion, target = hit
-            await _record(gw, request_id, key, route.name, [Attempt(CACHE_PROVIDER, target.model, "ok")], "ok",
-                          completion, latency_ms=(time.perf_counter() - started) * 1000)
-            return _response(request_id, completion, headers | {
-                "x-gateway-provider": CACHE_PROVIDER, "x-gateway-attempts": "0", "x-gateway-cache": "hit"})
-
-        # Cache hits are free, so the budget is only checked for requests that will reach a provider.
-        if key.monthly_budget_micros is not None:
-            # A soft limit: requests already in flight can take the key slightly past it.
-            async with gw.sessions() as session:
-                spent = (await month_usage(session, key.id)).spend_micros
-            if spent >= key.monthly_budget_micros:
-                raise BudgetExceeded(f"This key's monthly budget of ${key.monthly_budget_micros / 1e6:.2f} "
-                                     f"is used up (estimated spend ${spent / 1e6:.4f}). It resets on the 1st (UTC).")
-
-        # The cache works on the original request; only what goes to a provider is redacted.
-        outbound, vault = redact(chat) if gw.redact_pii else (chat, Vault())
-        if gw.redact_pii:
-            headers["x-gateway-redactions"] = str(vault.total)
-
-        if body.stream:
-            if gw.cache.enabled:
-                headers["x-gateway-cache"] = "bypass"
-            include_usage = bool(body.stream_options and body.stream_options.include_usage)
-            return await _stream(gw, request_id, key, route, outbound, vault, headers, started, include_usage)
-
+        lead = None
+        if cache and cache.read:
+            if (hit := await gw.cache.aget(cache.key)) is not None:
+                return await _answer_from_cache(gw, request_id, key, route.name, hit, headers, started, "hit")
+            if gw.coalescer.enabled:
+                # Someone may already be asking exactly this: wait for their answer instead of asking again.
+                joined = await gw.coalescer.join(cache.key, gw.cache, gw.resilience.policy.total_timeout_s)
+                if isinstance(joined, Joined):
+                    return await _answer_from_cache(gw, request_id, key, route.name, joined.value, headers, started,
+                                                    "coalesced")
+                lead = joined
         try:
-            result = await gw.resilience.complete(route, outbound, gw.providers)
-        except GatewayError as exc:
-            attempts = getattr(exc, "attempts", [])
-            await _record(gw, request_id, key, route.name, attempts, exc.code, None,
-                          latency_ms=(time.perf_counter() - started) * 1000, vault=vault)
+            return await _ask_providers(gw, request_id, key, route, chat, body, cache, lead, headers, started)
+        except Exception as exc:
+            if lead is not None:
+                lead.failed(exc)
             raise
-        completion, target = result.completion, result.target
-        completion = completion.model_copy(update={"text": vault.restore(completion.text)})
-        await _record(gw, request_id, key, route.name, result.attempts, "ok", completion,
-                      latency_ms=(time.perf_counter() - started) * 1000, vault=vault)
-        if cache and cache.write:
-            gw.cache.put(cache.key, (completion, target))
-        headers |= {"x-gateway-provider": target.provider, "x-gateway-attempts": str(result.calls)}
-        if cache is not None:
-            headers["x-gateway-cache"] = "miss" if cache.read else cache.reason
-        return _response(request_id, completion, headers)
+        finally:
+            if lead is not None:
+                await lead.release()
 
     return app
+
+
+async def _answer_from_cache(gw: "Gateway", request_id: str, key: ApiKey, route: str, entry: Entry,
+                             headers: dict[str, str], started: float, how: str) -> JSONResponse:
+    """`how` is "hit" (found in the cache) or "coalesced" (answered by an identical request in flight).
+    Either way no provider was called: the ledger row costs nothing."""
+    completion, target = entry
+    await _record(gw, request_id, key, route, [Attempt(CACHE_PROVIDER, target.model, "ok")], "ok",
+                  completion, latency_ms=(time.perf_counter() - started) * 1000)
+    return _response(request_id, completion, headers | {
+        "x-gateway-provider": CACHE_PROVIDER, "x-gateway-attempts": "0", "x-gateway-cache": how})
+
+
+async def _ask_providers(gw: "Gateway", request_id: str, key: ApiKey, route: Route, chat: ChatRequest,
+                         body: ChatCompletionRequest, cache: CachePlan | None, lead: Lead | None,
+                         headers: dict[str, str], started: float):
+    # Cache hits are free, so the budget is only checked for requests that will reach a provider.
+    if key.monthly_budget_micros is not None:
+        # A soft limit: requests already in flight can take the key slightly past it.
+        async with gw.sessions() as session:
+            spent = (await month_usage(session, key.id)).spend_micros
+        if spent >= key.monthly_budget_micros:
+            raise BudgetExceeded(f"This key's monthly budget of ${key.monthly_budget_micros / 1e6:.2f} "
+                                 f"is used up (estimated spend ${spent / 1e6:.4f}). It resets on the 1st (UTC).")
+
+    # The cache works on the original request; only what goes to a provider is redacted.
+    outbound, vault = redact(chat) if gw.redact_pii else (chat, Vault())
+    if gw.redact_pii:
+        headers["x-gateway-redactions"] = str(vault.total)
+
+    if body.stream:
+        if gw.cache.enabled:
+            headers["x-gateway-cache"] = "bypass"
+        include_usage = bool(body.stream_options and body.stream_options.include_usage)
+        return await _stream(gw, request_id, key, route, outbound, vault, headers, started, include_usage)
+
+    try:
+        result = await gw.resilience.complete(route, outbound, gw.providers)
+    except GatewayError as exc:
+        attempts = getattr(exc, "attempts", [])
+        await _record(gw, request_id, key, route.name, attempts, exc.code, None,
+                      latency_ms=(time.perf_counter() - started) * 1000, vault=vault)
+        raise
+    completion, target = result.completion, result.target
+    completion = completion.model_copy(update={"text": vault.restore(completion.text)})
+    await _record(gw, request_id, key, route.name, result.attempts, "ok", completion,
+                  latency_ms=(time.perf_counter() - started) * 1000, vault=vault)
+    if cache and cache.write:
+        await gw.cache.aput(cache.key, (completion, target))    # before the lead is released: others look here
+    if lead is not None:
+        lead.done((completion, target))
+    headers |= {"x-gateway-provider": target.provider, "x-gateway-attempts": str(result.calls)}
+    if cache is not None:
+        headers["x-gateway-cache"] = "miss" if cache.read else cache.reason
+    return _response(request_id, completion, headers)
 
 
 async def _stream(gw: Gateway, request_id: str, key: ApiKey, route: Route, chat: ChatRequest, vault: Vault,

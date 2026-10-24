@@ -1,0 +1,67 @@
+# Three gateway processes behind nginx, sharing Redis (limits, breakers, cache, requests in flight)
+# and Postgres (keys, ledger).
+#
+#   docker compose up -d --build
+#   docker compose run --rm migrate python -m gateway.keys create --name demo --rpm 30
+#   curl localhost:8080/v1/chat/completions -H "Authorization: Bearer gw_..." -H "content-type: application/json" \
+#        -d '{"model": "demo", "messages": [{"role": "user", "content": "hi"}]}' -i    # X-Upstream: which process
+#
+# Set GEMINI_API_KEY in your shell (or a .env next to this file) to use real models.
+
+x-gateway: &gateway
+  build: .
+  command: ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+  environment: &gateway-env
+    DATABASE_URL: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
+    REDIS_URL: redis://redis:6379/0
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    # The cache relies on Redis evicting least-recently-used keys when memory is full.
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  # Runs the migrations once, before any gateway starts (three gateways migrating at once would race).
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *gateway-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway-1: *gateway
+  gateway-2: *gateway
+  gateway-3: *gateway
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports: ["8080:80"]
+    volumes: ["./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
+    depends_on: [gateway-1, gateway-2, gateway-3]
+
+volumes:
+  pgdata:

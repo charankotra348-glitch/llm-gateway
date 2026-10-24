@@ -10,7 +10,8 @@ Clients can steer it with standard HTTP Cache-Control:
     no-cache   don't answer from the cache (still store the fresh answer)
     no-store   don't read or write the cache
 
-In-process LRU with a TTL. Several replicas each keep their own; Redis would share one.
+In-process LRU with a TTL. Several replicas each keep their own; with REDIS_URL set,
+redis_state.RedisResponseCache shares one.
 """
 
 import hashlib
@@ -80,6 +81,13 @@ class ResponseCache:
         self._entries.move_to_end(key)
         while len(self._entries) > self.max_entries:
             self._entries.popitem(last=False)   # least recently used
+
+    async def aget(self, key: str) -> Entry | None:
+        """The interface main.py uses; shared with redis_state.RedisResponseCache."""
+        return self.get(key)
+
+    async def aput(self, key: str, value: Entry) -> None:
+        self.put(key, value)
 
     def __len__(self) -> int:
         return len(self._entries)

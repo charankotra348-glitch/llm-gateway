@@ -1,0 +1,80 @@
+{
+  "date": "2026-10-24",
+  "machine": {
+    "cpus": 2,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "redis": "7.0.15",
+    "database": "Postgres"
+  },
+  "rate_limit": {
+    "each process alone": {
+      "limit_rpm": 30,
+      "sent": 90,
+      "allowed": 90,
+      "refused_429": 0
+    },
+    "shared through Redis": {
+      "limit_rpm": 30,
+      "sent": 90,
+      "allowed": 30,
+      "refused_429": 60
+    }
+  },
+  "coalescing": {
+    "cache only, each process alone": {
+      "requests": 60,
+      "ok": 60,
+      "provider_calls": 60,
+      "coalesced": 0,
+      "cache_hits": 0,
+      "p50_ms": 709.6,
+      "total_s": 0.75
+    },
+    "cache + coalescing, each process alone": {
+      "requests": 60,
+      "ok": 60,
+      "provider_calls": 3,
+      "coalesced": 57,
+      "cache_hits": 0,
+      "p50_ms": 687.1,
+      "total_s": 0.71
+    },
+    "cache + coalescing, shared through Redis": {
+      "requests": 60,
+      "ok": 60,
+      "provider_calls": 1,
+      "coalesced": 59,
+      "cache_hits": 0,
+      "p50_ms": 681.8,
+      "total_s": 0.7
+    }
+  },
+  "breakers": {
+    "each process alone": {
+      "requests": 60,
+      "ok": 60,
+      "paid_the_timeout": 15,
+      "mean_ms": 308.7,
+      "total_s": 6.2
+    },
+    "shared through Redis": {
+      "requests": 60,
+      "ok": 60,
+      "paid_the_timeout": 6,
+      "mean_ms": 156.8,
+      "total_s": 3.2
+    }
+  },
+  "overhead": {
+    "each process alone": {
+      "p50_ms_one_process_one_at_a_time": 2.1,
+      "requests_per_s_three_processes": 517.4,
+      "p50_ms_three_processes": 45.1
+    },
+    "shared through Redis": {
+      "p50_ms_one_process_one_at_a_time": 2.3,
+      "requests_per_s_three_processes": 429.4,
+      "p50_ms_three_processes": 54.7
+    }
+  }
+}
