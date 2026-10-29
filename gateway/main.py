@@ -22,6 +22,7 @@ from gateway.keys import KeyCache
 from gateway.ledger import CACHE_PROVIDER, LedgerWriter, month_usage
 from gateway.limits import RateLimiter
 from gateway.models import ApiKey, RequestLog
+from gateway.monitoring import init_error_tracking
 from gateway.pricing import PriceTable
 from gateway.providers.base import Provider
 from gateway.redaction import StreamRestorer, Vault, redact
@@ -136,6 +137,8 @@ async def authenticate(request: Request) -> ApiKey:
 
 
 def create_app(gateway: Gateway | None = None) -> FastAPI:
+    init_error_tracking(get_settings())
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.gateway = gateway or build_gateway(get_settings())

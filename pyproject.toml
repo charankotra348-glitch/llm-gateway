@@ -21,6 +21,7 @@ dependencies = [
     "aiosqlite>=0.20",
     "alembic>=1.13",
     "redis>=5.0",
+    "sentry-sdk>=2.0",
 ]
 
 [project.optional-dependencies]

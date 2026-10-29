@@ -202,6 +202,8 @@ Render's free plan sleeps after about 15 idle minutes, so the first request afte
 
 **A guided tour** for a demo or a recording: `python scripts/demo.py --base-url https://<your-service>.onrender.com --key gw_... --model fast` streams a real answer, sends 20 requests through the flaky route and shows the circuit breaker open, shows what the provider saw after redaction, answers a repeat question from the cache, and prints the key's usage. It pauses before each step; `--no-pause` runs straight through.
 
+**Monitoring.** Two free checks cover a demo deployment. Uptime: point an [UptimeRobot](https://uptimerobot.com) HTTP monitor at `https://<your-service>.onrender.com/healthz` every 5 minutes, which also keeps the free instance from sleeping during a demo week. Errors: set `SENTRY_DSN` to a free [Sentry](https://sentry.io) project and unhandled errors are reported with their stack trace, but never the request body, headers, cookies or local variables, since those carry prompts and keys ([`gateway/monitoring.py`](gateway/monitoring.py)). Without `SENTRY_DSN` nothing is sent anywhere.
+
 To run the image locally: `docker build -t llm-gateway . && docker run -p 8000:8000 llm-gateway` (SQLite inside the container), then create a key with `docker exec <container> python -m gateway.keys create --name local`.
 
 ## Why not just use LiteLLM?

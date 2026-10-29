@@ -14,3 +14,5 @@ services:
         value: deploy/routes.yaml
       - key: DEFAULT_RPM
         value: "20"
+      - key: SENTRY_DSN          # optional error tracking; leave empty to turn it off
+        sync: false

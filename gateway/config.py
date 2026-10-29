@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     bedrock_region: str = ""          # empty = Bedrock not configured
     ollama_url: str = ""              # e.g. http://localhost:11434; empty = not configured
+    sentry_dsn: str = ""              # error tracking; empty = off (see gateway/monitoring.py)
+    sentry_environment: str = "production"
     enable_fake: bool = True          # in-process fakes for demos and tests: "fake" and "flaky"
     flaky_failure_rate: float = 0.5   # share of calls the "flaky" fake fails, to demo fallback
     fake_chunk_delay_s: float = 0.05  # pause between streamed words from the fakes, so streaming is visible
