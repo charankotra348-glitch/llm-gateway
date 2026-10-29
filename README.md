@@ -217,6 +217,8 @@ I built it to learn what such a gateway has to get right, and to measure it:
 
 Knowing this is what makes a tool like LiteLLM configurable with intent: which cooldown and retry settings matter, what to cache, and what to watch in production.
 
+It also made LiteLLM's own code easier to read. Its usage-based router lost TPM/RPM counts when it kept them in Redis and requests finished at the same time (each one read the counts, added to them and wrote them back), so deployments went past their limits. That's the same problem this gateway's Lua scripts solve, and I fixed it there with atomic per-deployment counters and a concurrency regression test: [BerriAI/litellm#48583](https://github.com/BerriAI/litellm/pull/48583), fixing [#44917](https://github.com/BerriAI/litellm/issues/44917).
+
 ## What I'd add next
 
 - **Token-based rate limits and budgets checked before the call,** using an estimate of the request's tokens, instead of after.
